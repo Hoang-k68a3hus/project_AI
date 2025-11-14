@@ -246,7 +246,7 @@ Thư mục này chứa tài liệu chi tiết cho việc xây dựng hệ thốn
 **Location**: `model/phobert_recommendation.py`
 
 **Reuse**:
-- Embeddings từ `model/data/published_data/content_based_embeddings/`
+- Embeddings từ `data/published_data/content_based_embeddings/`
 - Product metadata từ `data_product.csv`, `data_product_attribute.csv`
 - Evaluation logic (`PhoBERTEvaluator` class)
 
@@ -400,7 +400,7 @@ flake8>=6.0.0            # Linting
 - **Verify**: `user_id` trong mappings matches request
 
 **Issue**: PhoBERT embeddings not found
-- **Solution**: Check path `model/data/published_data/content_based_embeddings/`
+- **Solution**: Check path `data/published_data/content_based_embeddings/`
 - **Verify**: Files exist: `product_embeddings.pt`
 
 ## Contribution Guidelines

@@ -7,7 +7,7 @@ Xây dựng pipeline xử lý dữ liệu ổn định, có khả năng tái t�
 ## Input Data Sources
 
 ### Raw CSV Files
-Tất cả nằm trong `model/data/published_data/`:
+Tất cả nằm trong `data/published_data/`:
 
 1. **data_reviews_purchase.csv**
    - Columns: `user_id`, `product_id`, `rating`, `comment`, `cmt_date`
@@ -55,6 +55,8 @@ Tất cả nằm trong `model/data/published_data/`:
 - **Rating distribution**: Check for rating bias (e.g., >90% ratings = 5)
 - **Action**: Log outliers, quyết định filter sau
 
+**✅ IMPLEMENTED**: See `recsys/cf/data.py` - `DataValidator` class with complete validation pipeline
+
 ### Step 2: Positive Signal Definition
 
 #### 2.1 Implicit Feedback Conversion
@@ -70,6 +72,8 @@ Tất cả nằm trong `model/data/published_data/`:
   - Users before/after: X → Y (Z% kept)
   - Items before/after: A → B (C% kept)
   - Interactions before/after: M → N (P% kept)
+
+**✅ IMPLEMENTED**: See `recsys/cf/data.py` - Functions: `create_positive_labels()`, `filter_users_items()`, `apply_positive_filtering_pipeline()`
 
 ### Step 3: ID Mapping (Contiguous Indexing)
 
@@ -249,7 +253,7 @@ Tất cả nằm trong `model/data/published_data/`:
 ```yaml
 # data_config.yaml
 raw_data:
-  base_path: "model/data/published_data"
+  base_path: "data/published_data"
   interactions: "data_reviews_purchase.csv"
   products: "data_product.csv"
   attributes: "data_product_attribute.csv"
@@ -319,6 +323,260 @@ versioning:
 - **Output**: Dict với loaded artifacts
 - **Purpose**: Load processed data cho training/serving
 
+## Component 8: BERT/PhoBERT Embeddings Pipeline
+
+### Purpose
+Tích hợp BERT embeddings vào data layer để hỗ trợ hybrid reranking và content-based fallback.
+
+### Step 1: Extract Product Descriptions
+
+#### Load Product Text Data
+```python
+  products_df = pd.read_csv('data/published_data/data_product.csv', encoding='utf-8')
+
+# Combine fields for rich text representation
+products_df['combined_text'] = (
+    products_df['product_name'] + ' [SEP] ' +
+    products_df['brand'].fillna('') + ' [SEP] ' +
+    products_df['processed_description'].fillna('')
+)
+```
+
+### Step 2: Generate BERT Embeddings
+
+#### Module: `recsys/bert/embedding_generator.py`
+
+```python
+import torch
+from transformers import AutoTokenizer, AutoModel
+import numpy as np
+from tqdm import tqdm
+
+class BERTEmbeddingGenerator:
+    """
+    Generate BERT/PhoBERT embeddings cho product descriptions.
+    """
+    
+    def __init__(self, model_name='vinai/phobert-base', device='cpu'):
+        self.device = device
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModel.from_pretrained(model_name).to(device)
+        self.model.eval()
+    
+    def encode_texts(self, texts, batch_size=32, max_length=256):
+        """
+        Encode texts thành embeddings.
+        
+        Args:
+            texts: List of text strings
+            batch_size: Batch size cho encoding
+            max_length: Max token length
+        
+        Returns:
+            np.array: (len(texts), hidden_dim) embeddings
+        """
+        embeddings = []
+        
+        with torch.no_grad():
+            for i in tqdm(range(0, len(texts), batch_size)):
+                batch_texts = texts[i:i+batch_size]
+                
+                # Tokenize
+                encoded = self.tokenizer(
+                    batch_texts,
+                    padding=True,
+                    truncation=True,
+                    max_length=max_length,
+                    return_tensors='pt'
+                ).to(self.device)
+                
+                # Forward pass
+                outputs = self.model(**encoded)
+                
+                # Mean pooling over sequence
+                batch_embeddings = outputs.last_hidden_state.mean(dim=1)
+                embeddings.append(batch_embeddings.cpu().numpy())
+        
+        return np.vstack(embeddings)
+    
+    def save_embeddings(self, embeddings, product_ids, output_path):
+        """
+        Save embeddings với metadata.
+        
+        Args:
+            embeddings: np.array (N, D)
+            product_ids: List of product IDs
+            output_path: Path to save .pt file
+        """
+        torch.save({
+            'embeddings': torch.from_numpy(embeddings),
+            'product_ids': product_ids,
+            'model_name': self.tokenizer.name_or_path,
+            'embedding_dim': embeddings.shape[1],
+            'num_products': len(product_ids),
+            'created_at': datetime.now().isoformat()
+        }, output_path)
+```
+
+### Step 3: Embedding Generation Workflow
+
+#### Script: `scripts/generate_bert_embeddings.py`
+```python
+"""
+Generate BERT embeddings cho all products.
+
+Usage:
+    python scripts/generate_bert_embeddings.py \
+        --model vinai/phobert-base \
+        --output data/processed/content_based_embeddings/
+"""
+
+import argparse
+import pandas as pd
+from recsys.bert.embedding_generator import BERTEmbeddingGenerator
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', default='vinai/phobert-base')
+    parser.add_argument('--output', default='data/processed/content_based_embeddings/')
+    parser.add_argument('--batch-size', type=int, default=32)
+    args = parser.parse_args()
+    
+    # Load products
+    products = pd.read_csv('data/published_data/data_product.csv', encoding='utf-8')
+    products['combined_text'] = (
+        products['product_name'] + ' [SEP] ' +
+        products['brand'].fillna('') + ' [SEP] ' +
+        products['processed_description'].fillna('')
+    )
+    
+    # Generate embeddings
+    generator = BERTEmbeddingGenerator(model_name=args.model)
+    embeddings = generator.encode_texts(
+        products['combined_text'].tolist(),
+        batch_size=args.batch_size
+    )
+    
+    # Save
+    os.makedirs(args.output, exist_ok=True)
+    output_file = os.path.join(args.output, 'product_embeddings.pt')
+    generator.save_embeddings(
+        embeddings,
+        products['product_id'].tolist(),
+        output_file
+    )
+    
+    print(f"Saved {len(embeddings)} embeddings to {output_file}")
+    print(f"Embedding dimension: {embeddings.shape[1]}")
+
+if __name__ == '__main__':
+    main()
+```
+
+### Step 4: User Profile Embeddings
+
+#### Strategy 1: Interaction-Weighted Average
+```python
+def compute_user_profile_embedding(user_history_items, item_embeddings, item_to_idx):
+    """
+    Compute user profile bằng weighted average của item embeddings.
+    
+    Args:
+        user_history_items: List[(product_id, weight)]
+        item_embeddings: np.array (num_items, dim)
+        item_to_idx: Dict mapping product_id -> idx
+    
+    Returns:
+        np.array: (dim,) user profile embedding
+    """
+    history_embeddings = []
+    weights = []
+    
+    for product_id, weight in user_history_items:
+        if product_id in item_to_idx:
+            idx = item_to_idx[product_id]
+            history_embeddings.append(item_embeddings[idx])
+            weights.append(weight)
+    
+    if not history_embeddings:
+        # Fallback: zero embedding hoặc mean embedding
+        return np.zeros(item_embeddings.shape[1])
+    
+    # Weighted average
+    history_embeddings = np.array(history_embeddings)
+    weights = np.array(weights).reshape(-1, 1)
+    weights = weights / weights.sum()  # Normalize
+    
+    user_profile = (history_embeddings * weights).sum(axis=0)
+    return user_profile
+```
+
+#### Strategy 2: TF-IDF Weighted
+```python
+from sklearn.feature_extraction.text import TfidfVectorizer
+
+def compute_user_tfidf_profile(user_history_texts, item_embeddings, product_ids):
+    """
+    Compute user profile bằng TF-IDF weighted item embeddings.
+    """
+    # Compute TF-IDF weights
+    vectorizer = TfidfVectorizer(max_features=1000)
+    tfidf_matrix = vectorizer.fit_transform(user_history_texts)
+    
+    # Weight embeddings by TF-IDF importance
+    # ... (implementation)
+```
+
+### Step 5: Embedding Versioning
+
+#### Metadata File: `data/processed/content_based_embeddings/embedding_metadata.json`
+```json
+{
+  "version": "v1_20250115_103000",
+  "model_name": "vinai/phobert-base",
+  "embedding_dim": 768,
+  "num_products": 2244,
+  "created_at": "2025-01-15T10:30:00",
+  "data_hash": "abc123...",
+  "git_commit": "def456...",
+  "files": {
+    "product_embeddings": "product_embeddings.pt",
+    "user_profiles": "user_profile_embeddings.pt"
+  }
+}
+```
+
+### Step 6: Sync with CF Data
+
+#### Validation: Check Alignment
+```python
+def validate_embedding_alignment(mappings_path, embeddings_path):
+    """
+    Validate BERT embeddings align với CF item mappings.
+    """
+    # Load mappings
+    with open(mappings_path) as f:
+        mappings = json.load(f)
+    
+    # Load embeddings
+    embeddings_data = torch.load(embeddings_path)
+    
+    cf_product_ids = set(mappings['item_to_idx'].keys())
+    bert_product_ids = set(str(pid) for pid in embeddings_data['product_ids'])
+    
+    # Check coverage
+    missing_in_bert = cf_product_ids - bert_product_ids
+    extra_in_bert = bert_product_ids - cf_product_ids
+    
+    print(f"CF products: {len(cf_product_ids)}")
+    print(f"BERT products: {len(bert_product_ids)}")
+    print(f"Missing in BERT: {len(missing_in_bert)}")
+    print(f"Extra in BERT: {len(extra_in_bert)}")
+    
+    if missing_in_bert:
+        warnings.warn(f"Warning: {len(missing_in_bert)} products have CF embeddings but no BERT embeddings")
+```
+
 ## Dependencies
 
 ```python
@@ -327,6 +585,11 @@ pandas>=1.5.0
 numpy>=1.23.0
 scipy>=1.9.0
 pyarrow>=10.0.0  # For parquet
+
+# BERT dependencies
+torch>=1.13.0
+transformers>=4.25.0
+sentencepiece>=0.1.96  # For PhoBERT tokenizer
 ```
 
 ## Error Handling

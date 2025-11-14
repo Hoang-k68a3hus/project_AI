@@ -755,6 +755,153 @@ def check_retrain_trigger():
         logger.info("No retrain needed")
 ```
 
+## Component 6: BERT Embeddings Monitoring
+
+### Embedding Freshness Tracking
+
+#### Metric: Embedding Age
+```python
+def check_embedding_freshness(embeddings_path):
+    """
+    Check embedding age và alert nếu stale.
+    """
+    metadata = torch.load(embeddings_path)
+    created_at = datetime.fromisoformat(metadata['created_at'])
+    age_days = (datetime.now() - created_at).days
+    
+    if age_days > 30:
+        send_alert(
+            subject="BERT Embeddings Stale",
+            message=f"Embeddings are {age_days} days old. Consider regenerating.",
+            severity="warning"
+        )
+    
+    return age_days
+```
+
+### Content Similarity Drift Detection
+
+#### Function: `detect_semantic_drift()`
+```python
+def detect_semantic_drift(old_embeddings, new_embeddings, product_ids, threshold=0.95):
+    """
+    Detect drift trong BERT embeddings (e.g., sau khi re-train PhoBERT).
+    
+    Args:
+        old_embeddings: np.array (N, 768)
+        new_embeddings: np.array (N, 768)
+        product_ids: List of product IDs
+        threshold: Correlation threshold
+    
+    Returns:
+        dict: Drift detection results
+    """
+    # Normalize
+    old_norm = old_embeddings / np.linalg.norm(old_embeddings, axis=1, keepdims=True)
+    new_norm = new_embeddings / np.linalg.norm(new_embeddings, axis=1, keepdims=True)
+    
+    # Cosine similarities (diagonal = self-similarity)
+    similarities = np.diag(old_norm @ new_norm.T)
+    
+    # Statistics
+    mean_sim = similarities.mean()
+    std_sim = similarities.std()
+    min_sim = similarities.min()
+    
+    # Identify drifted items
+    drifted_mask = similarities < threshold
+    drifted_products = [product_ids[i] for i in np.where(drifted_mask)[0]]
+    
+    drift_detected = mean_sim < threshold
+    
+    return {
+        'drift_detected': drift_detected,
+        'mean_similarity': mean_sim,
+        'std_similarity': std_sim,
+        'min_similarity': min_sim,
+        'num_drifted': len(drifted_products),
+        'drifted_products': drifted_products[:10],  # Top 10
+        'recommendation': 'Regenerate embeddings' if drift_detected else 'No action'
+    }
+```
+
+### Reranking Performance Tracking
+
+#### Table: `reranking_metrics`
+```sql
+CREATE TABLE reranking_metrics (
+    timestamp TIMESTAMP,
+    requests_with_rerank INTEGER,
+    requests_without_rerank INTEGER,
+    
+    -- Latency
+    avg_latency_rerank_ms REAL,
+    avg_latency_cf_only_ms REAL,
+    latency_overhead_pct REAL,
+    
+    -- Content scores
+    avg_content_score REAL,
+    avg_semantic_alignment REAL,
+    
+    -- Diversity
+    avg_diversity_rerank REAL,
+    avg_diversity_cf_only REAL
+);
+```
+
+#### Aggregation Function
+```python
+@scheduler.scheduled_job('cron', hour='*')  # Hourly
+def aggregate_reranking_metrics():
+    """
+    Aggregate reranking performance metrics.
+    """
+    conn = sqlite3.connect('logs/service_metrics.db')
+    
+    # Last hour stats
+    rerank_requests = pd.read_sql("""
+        SELECT 
+            COUNT(*) as num_requests,
+            AVG(latency_ms) as avg_latency,
+            AVG(content_score) as avg_content_score,
+            AVG(diversity) as avg_diversity
+        FROM requests
+        WHERE timestamp > datetime('now', '-1 hour')
+          AND rerank_enabled = 1
+    """, conn)
+    
+    cf_only_requests = pd.read_sql("""
+        SELECT 
+            COUNT(*) as num_requests,
+            AVG(latency_ms) as avg_latency,
+            AVG(diversity) as avg_diversity
+        FROM requests
+        WHERE timestamp > datetime('now', '-1 hour')
+          AND rerank_enabled = 0
+    """, conn)
+    
+    # Insert aggregated metrics
+    conn.execute("""
+        INSERT INTO reranking_metrics
+        (timestamp, requests_with_rerank, requests_without_rerank,
+         avg_latency_rerank_ms, avg_latency_cf_only_ms, latency_overhead_pct,
+         avg_content_score, avg_diversity_rerank, avg_diversity_cf_only)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        datetime.now(),
+        rerank_requests['num_requests'][0],
+        cf_only_requests['num_requests'][0],
+        rerank_requests['avg_latency'][0],
+        cf_only_requests['avg_latency'][0],
+        (rerank_requests['avg_latency'][0] / cf_only_requests['avg_latency'][0] - 1) * 100 if cf_only_requests['avg_latency'][0] > 0 else 0,
+        rerank_requests['avg_content_score'][0],
+        rerank_requests['avg_diversity'][0],
+        cf_only_requests['avg_diversity'][0]
+    ))
+    conn.commit()
+    conn.close()
+```
+
 ## Dependencies
 
 ```python
@@ -763,6 +910,9 @@ streamlit>=1.20.0  # Dashboard
 plotly>=5.13.0  # Plots
 apscheduler>=3.10.0  # Scheduling
 requests>=2.28.0  # Slack webhooks
+
+# BERT monitoring
+torch>=1.13.0
 ```
 
 ## Timeline Estimate
@@ -770,16 +920,18 @@ requests>=2.28.0  # Slack webhooks
 - **Training logging**: 1 day
 - **Service logging**: 1 day
 - **Drift detection**: 1 day
+- **BERT monitoring**: 1 day
 - **Alerting system**: 1 day
 - **Dashboard**: 1 day
 - **Integration & testing**: 1 day
-- **Total**: ~6 days
+- **Total**: ~7 days
 
 ## Success Criteria
 
 - [ ] Training runs logged với metrics
-- [ ] Service requests tracked (latency, fallback)
-- [ ] Drift detection runs weekly
+- [ ] Service requests tracked (latency, fallback, rerank)
+- [ ] Drift detection runs weekly (CF + BERT)
+- [ ] BERT embedding freshness monitored
 - [ ] Alerts sent cho critical issues
 - [ ] Dashboard visualizes metrics
 - [ ] Retrain triggered automatically khi needed

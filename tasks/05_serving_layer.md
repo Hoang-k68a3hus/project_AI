@@ -79,7 +79,9 @@ def load_model(self, model_id=None):
     V = np.load(f"{model_path}/{model_info['model_type']}_V.npy")
     
     # Load params
-    with open(f"{model_path}/*_params.json") as f:
+    # (đảm bảo module đã import os)
+    param_pattern = os.path.join(model_path, f"{model_info['model_type']}_params.json")
+    with open(param_pattern) as f:
         params = json.load(f)
     
     # Cache
@@ -136,8 +138,8 @@ def load_item_metadata(self):
     Returns:
         pd.DataFrame: Products với columns [product_id, product_name, brand, ...]
     """
-    products = pd.read_csv('model/data/published_data/data_product.csv', encoding='utf-8')
-    attributes = pd.read_csv('model/data/published_data/data_product_attribute.csv', encoding='utf-8')
+    products = pd.read_csv('data/published_data/data_product.csv', encoding='utf-8')
+    attributes = pd.read_csv('data/published_data/data_product_attribute.csv', encoding='utf-8')
     
     # Merge
     metadata = products.merge(attributes, on='product_id', how='left')
@@ -193,6 +195,25 @@ class CFRecommender:
         self.U = self.model['U']
         self.V = self.model['V']
         self.num_items = self.V.shape[0]
+        self.user_history_cache = self._load_user_histories()
+```
+
+##### Helper: `_load_user_histories()`
+```python
+def _load_user_histories(self):
+    """
+    Preload user → product interactions once để phục vụ low-latency.
+    """
+    interactions = pd.read_parquet(
+        'data/processed/interactions.parquet',
+        columns=['user_id', 'product_id']
+    )
+    history = (
+        interactions.groupby('user_id')['product_id']
+        .apply(lambda s: set(s.tolist()))
+        .to_dict()
+    )
+    return history
 ```
 
 ##### Method 1: `recommend(user_id, topk=10, exclude_seen=True, filter_params=None)`
@@ -279,10 +300,8 @@ def _get_user_history(self, user_id):
     Returns:
         set: Set of product_ids
     """
-    # Load từ processed data hoặc cache
-    interactions = pd.read_parquet('data/processed/interactions.parquet')
-    user_items = interactions[interactions['user_id'] == user_id]['product_id'].unique()
-    return set(user_items)
+    cached = self.user_history_cache.get(user_id)
+    return set(cached) if cached else set()
 ```
 
 ##### Method 3: `_apply_filters(filter_params)`
@@ -742,22 +761,122 @@ curl -X POST http://localhost:8000/recommend \
   }'
 ```
 
+## Component 6: BERT Embeddings Integration
+
+### Module: `service/recommender/phobert_loader.py`
+
+#### Class: `PhoBERTEmbeddingLoader`
+
+```python
+import numpy as np
+import torch
+from functools import lru_cache
+
+class PhoBERTEmbeddingLoader:
+    """
+    Load và cache BERT embeddings cho serving.
+    """
+    
+    def __init__(self, embeddings_path='data/processed/content_based_embeddings/product_embeddings.pt'):
+        self.embeddings_path = embeddings_path
+        self.embeddings = None  # (num_products, 768)
+        self.product_id_to_idx = {}
+        self.idx_to_product_id = {}
+        self._load_embeddings()
+    
+    def _load_embeddings(self):
+        """Load BERT embeddings và create mappings."""
+        bert_data = torch.load(self.embeddings_path, map_location='cpu')
+        
+        self.embeddings = bert_data['embeddings'].numpy()  # (N, 768)
+        product_ids = bert_data['product_ids']
+        
+        # Create mappings
+        for idx, pid in enumerate(product_ids):
+            self.product_id_to_idx[int(pid)] = idx
+            self.idx_to_product_id[idx] = int(pid)
+        
+        # Normalize for fast cosine similarity
+        norms = np.linalg.norm(self.embeddings, axis=1, keepdims=True)
+        self.embeddings_norm = self.embeddings / norms
+        
+        print(f"Loaded {len(self.product_id_to_idx)} BERT embeddings (dim={self.embeddings.shape[1]})")
+    
+    def get_embedding(self, product_id):
+        """Get embedding for single product."""
+        idx = self.product_id_to_idx.get(product_id)
+        if idx is not None:
+            return self.embeddings[idx]
+        return None
+    
+    def compute_user_profile(self, user_history_items, strategy='weighted_mean'):
+        """
+        Compute user profile embedding từ interaction history.
+        
+        Args:
+            user_history_items: List[(product_id, weight)] or List[product_id]
+            strategy: 'mean', 'weighted_mean', 'max'
+        
+        Returns:
+            np.array: (768,) user profile embedding
+        """
+        # Parse history
+        if isinstance(user_history_items[0], tuple):
+            product_ids = [pid for pid, _ in user_history_items]
+            weights = [w for _, w in user_history_items]
+        else:
+            product_ids = user_history_items
+            weights = [1.0] * len(product_ids)
+        
+        # Get embeddings
+        history_embeddings = []
+        history_weights = []
+        
+        for pid, weight in zip(product_ids, weights):
+            emb = self.get_embedding(pid)
+            if emb is not None:
+                history_embeddings.append(emb)
+                history_weights.append(weight)
+        
+        if not history_embeddings:
+            # Fallback: return mean embedding
+            return np.zeros(self.embeddings.shape[1])
+        
+        history_embeddings = np.array(history_embeddings)
+        history_weights = np.array(history_weights).reshape(-1, 1)
+        
+        # Aggregate
+        if strategy == 'mean':
+            profile = np.mean(history_embeddings, axis=0)
+        elif strategy == 'weighted_mean':
+            weights_norm = history_weights / history_weights.sum()
+            profile = (history_embeddings * weights_norm).sum(axis=0)
+        elif strategy == 'max':
+            profile = np.max(history_embeddings, axis=0)
+        else:
+            raise ValueError(f"Unknown strategy: {strategy}")
+        
+        return profile
+```
+
 ## Timeline Estimate
 
 - **Loader + Recommender**: 2 days
 - **Fallback logic**: 0.5 day
 - **API endpoints**: 1 day
-- **Reranking (optional)**: 1 day
+- **BERT integration + Reranking**: 2 days
 - **Testing**: 1 day
 - **Deployment setup**: 0.5 day
-- **Total**: ~6 days
+- **Total**: ~7 days
 
 ## Success Criteria
 
 - [ ] Load model từ registry (<1 second)
-- [ ] Generate recommendations (<100ms per user)
+- [ ] Generate recommendations (<100ms per user CF-only)
+- [ ] Two-stage reranking (<200ms with BERT)
+- [ ] BERT embeddings loaded and cached
 - [ ] Cold-start fallback works
 - [ ] API endpoints functional
 - [ ] Hot-reload model without downtime
-- [ ] Logging tracks latency, fallback rate
+- [ ] Logging tracks latency, fallback rate, rerank metrics
 - [ ] Docker deployment tested

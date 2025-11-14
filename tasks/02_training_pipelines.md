@@ -497,6 +497,236 @@ python scripts/train_cf.py \
   - Recall@10: >0.22 (slightly better than ALS)
   - NDCG@10: >0.16
 
+## Pipeline Extension: BERT-Enhanced Training
+
+### Strategy 1: BERT-Initialized Item Factors
+
+#### Purpose
+Khởi tạo ALS/BPR item embeddings từ BERT embeddings để transfer semantic knowledge.
+
+#### Implementation: ALS with BERT Init
+
+```python
+from sklearn.decomposition import TruncatedSVD
+
+class BERTEnhancedALS:
+    """
+    ALS với item factors initialized từ BERT embeddings.
+    """
+    
+    def __init__(self, bert_embeddings_path, factors=128, **als_params):
+        self.factors = factors
+        self.als_params = als_params
+        
+        # Load BERT embeddings
+        bert_data = torch.load(bert_embeddings_path)
+        self.bert_embeddings = bert_data['embeddings'].numpy()  # (num_items, 768)
+        self.product_ids = bert_data['product_ids']
+    
+    def project_bert_to_factors(self, target_dim):
+        """
+        Project BERT embeddings (768-dim) xuống target_dim using SVD.
+        """
+        if self.bert_embeddings.shape[1] == target_dim:
+            return self.bert_embeddings
+        
+        svd = TruncatedSVD(n_components=target_dim, random_state=42)
+        projected = svd.fit_transform(self.bert_embeddings)
+        
+        print(f"BERT projection: {self.bert_embeddings.shape[1]} -> {target_dim}")
+        print(f"Explained variance: {svd.explained_variance_ratio_.sum():.3f}")
+        
+        return projected
+    
+    def fit(self, X_train, item_to_idx):
+        """
+        Train ALS với BERT-initialized item factors.
+        """
+        from implicit.als import AlternatingLeastSquares
+        
+        # Initialize ALS model
+        model = AlternatingLeastSquares(
+            factors=self.factors,
+            **self.als_params
+        )
+        
+        # Project BERT embeddings
+        projected_embeddings = self.project_bert_to_factors(self.factors)
+        
+        # Align với item ordering trong CSR matrix
+        aligned_embeddings = np.zeros((X_train.shape[1], self.factors))
+        for i, product_id in enumerate(self.product_ids):
+            if str(product_id) in item_to_idx:
+                idx = item_to_idx[str(product_id)]
+                aligned_embeddings[idx] = projected_embeddings[i]
+        
+        # Initialize item_factors
+        model.item_factors = aligned_embeddings.astype(np.float32)
+        
+        print("Item factors initialized from BERT embeddings")
+        
+        # Fit (ALS will fine-tune from BERT initialization)
+        model.fit(X_train.T)  # Transpose for implicit library
+        
+        return model
+```
+
+#### Configuration Extension
+
+```yaml
+als:
+  factors: 128
+  regularization: 0.01
+  iterations: 15
+  alpha: 40
+  use_gpu: false
+  random_seed: 42
+  
+  # BERT initialization
+  bert_init:
+    enabled: true
+    embeddings_path: "data/processed/content_based_embeddings/product_embeddings.pt"
+    projection_method: "svd"  # or "pca", "random"
+    freeze_first_iter: false  # Keep BERT init frozen for first iteration
+
+bpr:
+  factors: 128
+  learning_rate: 0.05
+  regularization: 0.0001
+  epochs: 50
+  samples_per_epoch: 5
+  negative_sampling: "uniform"
+  random_seed: 42
+  
+  # BERT initialization
+  bert_init:
+    enabled: true
+    embeddings_path: "data/processed/content_based_embeddings/product_embeddings.pt"
+    projection_method: "svd"
+```
+
+### Strategy 2: Multi-Task Learning (Experimental)
+
+#### Joint Optimization of CF + Content Loss
+
+```python
+import torch
+import torch.nn as nn
+
+class HybridCFBERTModel(nn.Module):
+    """
+    Multi-task model: CF loss + content similarity loss.
+    """
+    
+    def __init__(self, num_users, num_items, factors=128, bert_dim=768):
+        super().__init__()
+        
+        # CF embeddings
+        self.user_embedding = nn.Embedding(num_users, factors)
+        self.item_embedding = nn.Embedding(num_items, factors)
+        
+        # BERT projection
+        self.bert_projection = nn.Linear(bert_dim, factors)
+        
+        # Initialize
+        nn.init.normal_(self.user_embedding.weight, std=0.01)
+        nn.init.normal_(self.item_embedding.weight, std=0.01)
+    
+    def forward(self, user_ids, item_ids, item_bert_embeddings):
+        # CF score
+        user_emb = self.user_embedding(user_ids)  # (B, factors)
+        item_emb = self.item_embedding(item_ids)  # (B, factors)
+        cf_score = (user_emb * item_emb).sum(dim=1)  # (B,)
+        
+        # Content score
+        item_bert_proj = self.bert_projection(item_bert_embeddings)  # (B, factors)
+        content_score = (user_emb * item_bert_proj).sum(dim=1)  # (B,)
+        
+        return cf_score, content_score
+    
+    def compute_loss(self, cf_score_pos, cf_score_neg, content_score_pos, content_score_neg, 
+                     cf_weight=0.7, content_weight=0.3):
+        """
+        Multi-task BPR loss.
+        """
+        # CF BPR loss
+        cf_loss = -torch.log(torch.sigmoid(cf_score_pos - cf_score_neg)).mean()
+        
+        # Content BPR loss
+        content_loss = -torch.log(torch.sigmoid(content_score_pos - content_score_neg)).mean()
+        
+        # Combined
+        total_loss = cf_weight * cf_loss + content_weight * content_loss
+        
+        return total_loss, cf_loss.item(), content_loss.item()
+```
+
+### Training Comparison: Cold-Start Performance
+
+#### Evaluation: Test on Cold-Start Items
+
+```python
+def evaluate_cold_start_items(model, test_data, item_to_idx, cold_threshold=5):
+    """
+    Evaluate performance on cold-start items (few interactions).
+    
+    Args:
+        cold_threshold: Items với <N interactions considered cold-start
+    """
+    # Identify cold-start items
+    item_counts = test_data['product_id'].value_counts()
+    cold_items = set(item_counts[item_counts < cold_threshold].index)
+    
+    # Filter test data
+    cold_test = test_data[test_data['product_id'].isin(cold_items)]
+    
+    # Evaluate
+    metrics = evaluate_model(model, cold_test, ...)
+    
+    return metrics
+
+# Compare BERT-init vs Random-init
+bert_als_cold_recall = evaluate_cold_start_items(bert_als_model, test_data, ...)
+random_als_cold_recall = evaluate_cold_start_items(random_als_model, test_data, ...)
+
+print(f"Cold-start Recall@10:")
+print(f"  BERT-init ALS: {bert_als_cold_recall['recall@10']:.3f}")
+print(f"  Random-init ALS: {random_als_cold_recall['recall@10']:.3f}")
+print(f"  Improvement: {(bert_als_cold_recall['recall@10'] / random_als_cold_recall['recall@10'] - 1):.1%}")
+```
+
+### Training Artifacts: BERT Metadata
+
+#### Extended Metadata File
+
+```json
+{
+  "model_type": "als",
+  "factors": 128,
+  "regularization": 0.01,
+  "iterations": 15,
+  "alpha": 40,
+  "random_seed": 42,
+  "training_time_seconds": 102.8,
+  
+  "bert_initialization": {
+    "enabled": true,
+    "embeddings_path": "data/processed/content_based_embeddings/product_embeddings.pt",
+    "embedding_version": "v1_20250115_103000",
+    "projection_method": "svd",
+    "original_dim": 768,
+    "projected_dim": 128,
+    "explained_variance": 0.873
+  },
+  
+  "cold_start_performance": {
+    "cold_threshold": 5,
+    "recall@10": 0.189,
+    "improvement_vs_random": 0.234
+  }
+}
+```
+
 ## Dependencies
 
 ```python
@@ -508,6 +738,10 @@ implicit>=0.6.0  # For ALS
 scikit-learn>=1.2.0  # For metrics
 pyyaml>=6.0  # For config
 tqdm>=4.64.0  # Progress bars
+
+# BERT training
+torch>=1.13.0
+transformers>=4.25.0
 ```
 
 ## Timeline Estimate

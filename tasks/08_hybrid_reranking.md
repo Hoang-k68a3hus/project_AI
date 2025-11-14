@@ -13,18 +13,24 @@ CF Recommender (ALS/BPR)
     ↓
 Top-K Candidates (e.g., K=50)
     ↓
-Reranking Layer
+Reranking Layer (PhoBERTEmbeddingLoader from Task 05)
     ↓
-├─ Content Similarity (PhoBERT)
+├─ Content Similarity (PhoBERT cosine similarity)
 ├─ Popularity Signal (num_sold_time)
 ├─ Quality Signal (avg_star)
 ├─ Attribute Match (brand, skin_type)
-└─ Diversity Boost
+└─ Diversity Boost (intra-list diversity)
     ↓
 Weighted Combination
     ↓
 Final Top-K (e.g., K=10)
 ```
+
+**Key Integration Points**:
+- **PhoBERTEmbeddingLoader** (Task 05): Handles BERT embedding loading, user profile computation, and cosine similarity scoring
+- **Diversity Metrics** (Task 03): `compute_diversity_bert()` evaluates intra-list diversity using BERT embeddings
+- **Semantic Alignment** (Task 03): `compute_semantic_alignment()` measures user profile → recommendation relevance
+- **Model Registry** (Task 04): Tracks BERT embedding versions and compatibility with CF models
 
 ## Component 1: PhoBERT Integration
 
@@ -32,7 +38,9 @@ Final Top-K (e.g., K=10)
 
 #### Module: `service/recommender/phobert_loader.py`
 
-##### Class: `PhoBERTEmbeddings`
+**NOTE**: This module is now superseded by `PhoBERTEmbeddingLoader` in Task 05 (`serving_layer.md`). The class below provides basic embedding loading, while the Task 05 implementation includes advanced features like user profile computation, LRU caching, and normalized embeddings.
+
+##### Class: `PhoBERTEmbeddings` (Basic Version)
 ```python
 import numpy as np
 import torch
@@ -41,9 +49,14 @@ from pathlib import Path
 class PhoBERTEmbeddings:
     """
     Load và manage PhoBERT embeddings cho content-based similarity.
+    
+    For production use, prefer PhoBERTEmbeddingLoader from Task 05 which includes:
+    - User profile computation (interaction-weighted, TF-IDF)
+    - LRU caching for performance
+    - Normalized embeddings for cosine similarity
     """
     
-    def __init__(self, embeddings_path='model/data/published_data/content_based_embeddings'):
+    def __init__(self, embeddings_path='data/processed/content_based_embeddings'):
         self.embeddings_path = Path(embeddings_path)
         self.product_embeddings = None  # Shape: (num_products, 768)
         self.product_id_to_idx = {}
@@ -53,7 +66,7 @@ class PhoBERTEmbeddings:
     
     def _load_embeddings(self):
         """Load PhoBERT embeddings từ .pt file."""
-        # Load product embeddings
+        # Load product embeddings (standardized path from Task 01)
         emb_file = self.embeddings_path / 'product_embeddings.pt'
         
         if emb_file.exists():
@@ -186,21 +199,21 @@ class HybridReranker:
         self.phobert = phobert_embeddings
         self.metadata = item_metadata
         
-        # Default weights
+        # Default weights (tuned using Task 03 evaluation metrics)
         self.config = config or {
             'weights': {
-                'cf': 0.5,
-                'content': 0.2,
-                'popularity': 0.15,
-                'quality': 0.15
+                'cf': 0.5,          # Collaborative filtering score
+                'content': 0.2,     # PhoBERT cosine similarity
+                'popularity': 0.15, # Normalized num_sold_time
+                'quality': 0.15     # Normalized avg_star
             },
             'diversity': {
                 'enabled': True,
-                'penalty': 0.1,  # Penalty cho similar items
-                'threshold': 0.9  # Similarity threshold
-            }
+                'penalty': 0.1,      # Penalty cho similar items
+                'threshold': 0.9     # BERT similarity threshold
+            },
+            'user_profile_strategy': 'weighted_mean'  # From Task 01: weighted_mean, tf_idf, recency
         }
-```
 
 ##### Method 1: `rerank(cf_recommendations, user_id, user_history=None)`
 ```python
@@ -215,7 +228,12 @@ def rerank(self, cf_recommendations, user_id, user_history=None):
         user_history: Optional list of product IDs user interacted with
     
     Returns:
-        list: Reranked recommendations
+        list: Reranked recommendations với augmented scores
+    
+    Note:
+        - Uses PhoBERTEmbeddingLoader.compute_user_profile() for content scoring
+        - Applies diversity penalty using Task 03 diversity metric logic
+        - Final scores stored in 'final_score' key
     """
     if not cf_recommendations:
         return []
@@ -223,8 +241,16 @@ def rerank(self, cf_recommendations, user_id, user_history=None):
     # Extract product IDs
     candidate_ids = [rec['product_id'] for rec in cf_recommendations]
     
+    # Compute user profile (Task 05: PhoBERTEmbeddingLoader)
+    user_profile_emb = None
+    if user_history:
+        user_profile_emb = self.phobert.compute_user_profile(
+            user_history,
+            strategy=self.config['user_profile_strategy']
+        )
+    
     # Compute signals
-    signals = self._compute_signals(candidate_ids, user_history)
+    signals = self._compute_signals(candidate_ids, user_profile_emb)
     
     # Normalize signals
     normalized = self._normalize_signals(signals)
@@ -232,7 +258,7 @@ def rerank(self, cf_recommendations, user_id, user_history=None):
     # Combine với weights
     final_scores = self._combine_scores(normalized, self.config['weights'])
     
-    # Apply diversity penalty (optional)
+    # Apply diversity penalty (Task 03: BERT-based diversity)
     if self.config['diversity']['enabled']:
         final_scores = self._apply_diversity_penalty(final_scores, candidate_ids)
     
@@ -640,7 +666,7 @@ def compute_category_coverage(recommendations, metadata):
 #### Script: `scripts/evaluate_hybrid.py`
 ```python
 """
-Evaluate hybrid reranking vs pure CF.
+Evaluate hybrid reranking vs pure CF using Task 03 metrics.
 """
 
 def main():
@@ -652,7 +678,7 @@ def main():
     test_data = pd.read_parquet('data/processed/interactions.parquet')
     test_users = test_data[test_data['split'] == 'test']['user_id'].unique()
     
-    # Evaluate both
+    # Evaluate both (Task 03: evaluate_hybrid_model)
     cf_metrics = evaluate_recommendations(cf_recommender, test_users)
     hybrid_metrics = evaluate_recommendations(hybrid_recommender, test_users)
     
@@ -660,12 +686,28 @@ def main():
     print("CF Metrics:", cf_metrics)
     print("Hybrid Metrics:", hybrid_metrics)
     
-    # Diversity comparison
-    cf_diversity = compute_avg_diversity(cf_recommender, test_users[:100])
-    hybrid_diversity = compute_avg_diversity(hybrid_recommender, test_users[:100])
+    # Diversity comparison (Task 03: compute_diversity_bert)
+    cf_diversity = compute_diversity_bert(
+        cf_recommender, 
+        test_users[:100],
+        bert_embeddings=phobert_loader
+    )
+    hybrid_diversity = compute_diversity_bert(
+        hybrid_recommender, 
+        test_users[:100],
+        bert_embeddings=phobert_loader
+    )
     
     print(f"CF Diversity: {cf_diversity:.3f}")
     print(f"Hybrid Diversity: {hybrid_diversity:.3f}")
+    
+    # Semantic alignment (Task 03)
+    hybrid_alignment = compute_semantic_alignment(
+        hybrid_recommender,
+        test_users[:100],
+        bert_embeddings=phobert_loader
+    )
+    print(f"Semantic Alignment: {hybrid_alignment:.3f}")
 ```
 
 ## Component 7: Use Cases
@@ -677,6 +719,10 @@ recs_cf = recommender.recommend(user_id=12345, topk=10, rerank=False)
 
 # Hybrid (CF + content + popularity)
 recs_hybrid = recommender.recommend(user_id=12345, topk=10, rerank=True)
+
+# Compare diversity
+print(f"CF Diversity: {compute_diversity_bert(recs_cf):.3f}")
+print(f"Hybrid Diversity: {compute_diversity_bert(recs_hybrid):.3f}")
 ```
 
 ### Use Case 2: Cold-Start User với Attribute Filtering
@@ -688,11 +734,14 @@ recs = recommender.recommend(
     topk=10,
     filter_params={'brand': 'Innisfree'}
 )
+
+# For completely new users, use BERT-based content recommendations
+# (Task 05: PhoBERTEmbeddingLoader can generate user profiles from browsing history)
 ```
 
-### Use Case 3: Similar Items (Content-Based)
+### Use Case 3: Similar Items (Content-Based with BERT)
 ```python
-# Recommend similar products to a given item
+# Recommend similar products to a given item (Task 05 implementation)
 source_product = 123
 candidates = recommender.phobert_embeddings.compute_similarity(
     source_product,
@@ -716,6 +765,129 @@ recs = recommender.recommend(user_id=12345, topk=10, rerank=True)
 
 ```python
 # requirements_hybrid.txt
+torch>=1.13.0  # BERT embeddings (Task 01)
+transformers>=4.25.0  # PhoBERT model
+numpy>=1.22.0
+pandas>=1.4.0
+scipy>=1.8.0
+scikit-learn>=1.1.0  # Normalization
+```
+
+## Configuration Examples
+
+### Config 1: Content-Heavy (Cold-Start Focused)
+```python
+config = {
+    'weights': {
+        'cf': 0.3,
+        'content': 0.4,  # Higher weight on BERT similarity
+        'popularity': 0.2,
+        'quality': 0.1
+    },
+    'diversity': {
+        'enabled': True,
+        'penalty': 0.15,
+        'threshold': 0.85  # More aggressive diversity
+    },
+    'user_profile_strategy': 'tf_idf'  # Task 01: emphasize unique preferences
+}
+```
+
+### Config 2: CF-Heavy (Collaborative Signal Focused)
+```python
+config = {
+    'weights': {
+        'cf': 0.7,
+        'content': 0.1,
+        'popularity': 0.1,
+        'quality': 0.1
+    },
+    'diversity': {
+        'enabled': False  # Pure CF ranking
+    },
+    'user_profile_strategy': 'weighted_mean'  # Task 01: balanced averaging
+}
+```
+
+### Config 3: Balanced Hybrid (Recommended)
+```python
+config = {
+    'weights': {
+        'cf': 0.5,
+        'content': 0.2,
+        'popularity': 0.15,
+        'quality': 0.15
+    },
+    'diversity': {
+        'enabled': True,
+        'penalty': 0.1,
+        'threshold': 0.9  # Moderate diversity boost
+    },
+    'user_profile_strategy': 'weighted_mean'  # Task 01: default strategy
+}
+```
+
+## Cross-Task Integration Summary
+
+**Task 01 (Data Layer)**:
+- `BERTEmbeddingGenerator`: Generates product_embeddings.pt
+- User profile strategies: weighted_mean, tf_idf, recency
+- Embedding versioning with metadata
+
+**Task 02 (Training Pipelines)**:
+- `BERTEnhancedALS`: Initialize item factors from BERT embeddings via SVD
+- Multi-task learning: Dual loss (CF + content alignment)
+
+**Task 03 (Evaluation Metrics)**:
+- `compute_diversity_bert()`: Intra-list diversity using BERT similarities
+- `compute_semantic_alignment()`: User profile → recommendations relevance
+- `evaluate_hybrid_model()`: CF vs CF+BERT comparison framework
+
+**Task 04 (Model Registry)**:
+- BERT embedding artifact tracking with version compatibility
+- `load_model_with_embeddings()`: Atomic loading of CF model + BERT embeddings
+
+**Task 05 (Serving Layer)**:
+- `PhoBERTEmbeddingLoader`: Production-ready BERT loader with LRU caching
+- Two-stage recommendation: CF candidates → BERT reranking
+- `compute_user_profile()`: Aggregate user history into BERT space
+
+**Task 06 (Monitoring)**:
+- `check_embedding_freshness()`: Alert if BERT embeddings stale
+- `detect_semantic_drift()`: Compare embedding versions via cosine similarity
+
+**Task 07 (Automation)**:
+- `refresh_bert_embeddings.py`: Weekly regeneration of product embeddings
+- Cron job: Tuesday 3am BERT refresh, aligned with model training schedule
+
+**Task 08 (This Task)**:
+- `HybridReranker`: Weighted combination of CF + BERT + metadata signals
+- Diversity penalty using BERT similarity thresholds
+- End-to-end integration of all previous components
+
+## Timeline Estimate
+
+- **PhoBERT loader refactoring**: 0.5 day (already in Task 05)
+- **HybridReranker implementation**: 1 day
+- **Signal computation methods**: 1 day
+- **Diversity penalty logic**: 0.5 day
+- **Configuration tuning**: 1 day (using Task 03 metrics)
+- **Testing và validation**: 1 day
+- **Documentation updates**: 0.5 day
+- **Total**: ~5.5 days (excluding Task 05 work already done)
+
+## Success Criteria
+
+- [ ] HybridReranker integrated with PhoBERTEmbeddingLoader (Task 05)
+- [ ] Weighted score combination implemented
+- [ ] Diversity penalty reduces BERT similarity clustering
+- [ ] Semantic alignment (Task 03) > 0.7 for hybrid recommendations
+- [ ] Diversity (Task 03) improves by ≥10% over pure CF
+- [ ] Cold-start coverage (Task 03) increases with content signals
+- [ ] Configuration examples tested across user segments
+- [ ] Integration with monitoring (Task 06) for embedding freshness
+- [ ] Automation (Task 07) ensures weekly BERT updates
+- [ ] Documentation complete with cross-task references
 torch>=1.13.0  # PhoBERT embeddings
 transformers>=4.25.0  # PhoBERT model (nếu cần encode mới)
 ```

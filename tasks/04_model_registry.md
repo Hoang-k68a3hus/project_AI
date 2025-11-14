@@ -503,6 +503,248 @@ def main():
         print(f"Selected best model: {best['model_id']}")
 ```
 
+## BERT Embeddings Registry Extension
+
+### Embedding Artifacts Tracking
+
+#### Extended Registry Schema
+
+```json
+{
+  "current_best": {
+    "model_id": "als_v2_20250116_141500",
+    "model_type": "als",
+    "version": "v2_20250116_141500",
+    "path": "artifacts/cf/als/v2_20250116_141500",
+    "selection_metric": "ndcg@10",
+    "selection_value": 0.195,
+    "selected_at": "2025-01-16T14:30:00",
+    "selected_by": "auto",
+    
+    "bert_embeddings": {
+      "version": "v1_20250115_103000",
+      "path": "data/processed/content_based_embeddings/product_embeddings.pt",
+      "model_name": "vinai/phobert-base",
+      "embedding_dim": 768
+    }
+  },
+  
+  "models": {
+    "als_v2_20250116_141500": {
+      "model_type": "als",
+      "version": "v2_20250116_141500",
+      "path": "artifacts/cf/als/v2_20250116_141500",
+      "created_at": "2025-01-16T14:15:00",
+      "data_version": "abc123...",
+      "git_commit": "ghi789...",
+      
+      "hyperparameters": {
+        "factors": 128,
+        "regularization": 0.01,
+        "iterations": 20,
+        "alpha": 60,
+        "bert_init_enabled": true
+      },
+      
+      "metrics": {
+        "recall@10": 0.245,
+        "ndcg@10": 0.195,
+        "coverage": 0.310,
+        "diversity@10": 0.418,
+        "semantic_alignment@10": 0.531,
+        "cold_start_coverage": 0.142
+      },
+      
+      "bert_integration": {
+        "embeddings_version": "v1_20250115_103000",
+        "embeddings_path": "data/processed/content_based_embeddings/product_embeddings.pt",
+        "model_name": "vinai/phobert-base",
+        "embedding_dim": 768,
+        "projection_method": "svd",
+        "projected_dim": 128,
+        "explained_variance": 0.873,
+        "initialization_strategy": "item_factors_only",
+        "alignment_validated": true
+      },
+      
+      "status": "active"
+    }
+  },
+  
+  "bert_embeddings": {
+    "v1_20250115_103000": {
+      "version": "v1_20250115_103000",
+      "created_at": "2025-01-15T10:30:00",
+      "model_name": "vinai/phobert-base",
+      "embedding_dim": 768,
+      "num_products": 2244,
+      "files": {
+        "product_embeddings": "data/processed/content_based_embeddings/product_embeddings.pt",
+        "metadata": "data/processed/content_based_embeddings/embedding_metadata.json"
+      },
+      "data_hash": "abc123...",
+      "git_commit": "def456...",
+      "status": "active"
+    }
+  },
+  
+  "metadata": {
+    "registry_version": "1.1",
+    "last_updated": "2025-01-16T14:30:00",
+    "num_models": 3,
+    "num_embeddings": 1,
+    "selection_criteria": "ndcg@10"
+  }
+}
+```
+
+### Registry Operations: BERT Extensions
+
+#### Function: `register_bert_embeddings(embeddings_path, metadata)`
+
+```python
+def register_bert_embeddings(embeddings_path, metadata):
+    """
+    Register BERT embeddings trong registry.
+    
+    Args:
+        embeddings_path: Path to .pt file
+        metadata: Dict với model_name, embedding_dim, created_at, etc.
+    
+    Returns:
+        str: Embedding version ID
+    """
+    # Load registry
+    registry = load_registry_json('artifacts/cf/registry.json')
+    
+    # Generate version ID
+    version = metadata.get('version', f"v{len(registry.get('bert_embeddings', {})) + 1}_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+    
+    # Add entry
+    if 'bert_embeddings' not in registry:
+        registry['bert_embeddings'] = {}
+    
+    registry['bert_embeddings'][version] = {
+        'version': version,
+        'created_at': metadata['created_at'],
+        'model_name': metadata['model_name'],
+        'embedding_dim': metadata['embedding_dim'],
+        'num_products': metadata['num_products'],
+        'files': {
+            'product_embeddings': embeddings_path,
+            'metadata': embeddings_path.replace('.pt', '_metadata.json')
+        },
+        'data_hash': metadata.get('data_hash'),
+        'git_commit': metadata.get('git_commit'),
+        'status': 'active'
+    }
+    
+    # Update metadata
+    registry['metadata']['num_embeddings'] = len(registry['bert_embeddings'])
+    registry['metadata']['last_updated'] = datetime.now().isoformat()
+    
+    # Save
+    save_registry_json(registry, 'artifacts/cf/registry.json')
+    
+    logger.info(f"Registered BERT embeddings: {version}")
+    return version
+```
+
+#### Function: `validate_model_embeddings_compatibility(model_id, embeddings_version)`
+
+```python
+def validate_model_embeddings_compatibility(model_id, embeddings_version):
+    """
+    Validate model và embeddings alignment.
+    
+    Returns:
+        dict: {
+            'compatible': bool,
+            'warnings': list[str],
+            'data_hash_match': bool,
+            'dimension_match': bool
+        }
+    """
+    registry = load_registry_json('artifacts/cf/registry.json')
+    
+    model = registry['models'][model_id]
+    embeddings = registry['bert_embeddings'][embeddings_version]
+    
+    warnings = []
+    
+    # Check data hash
+    data_hash_match = model['data_version'] == embeddings['data_hash']
+    if not data_hash_match:
+        warnings.append(f"Data version mismatch: model={model['data_version']}, embeddings={embeddings['data_hash']}")
+    
+    # Check dimensions
+    dimension_match = True
+    if 'bert_integration' in model:
+        if model['bert_integration']['embedding_dim'] != embeddings['embedding_dim']:
+            dimension_match = False
+            warnings.append(f"Embedding dimension mismatch")
+    
+    compatible = data_hash_match and dimension_match
+    
+    return {
+        'compatible': compatible,
+        'warnings': warnings,
+        'data_hash_match': data_hash_match,
+        'dimension_match': dimension_match
+    }
+```
+
+#### Function: `load_model_with_embeddings(model_id=None, embeddings_version=None)`
+
+```python
+def load_model_with_embeddings(model_id=None, embeddings_version=None):
+    """
+    Load CF model và BERT embeddings đồng thời.
+    
+    Returns:
+        dict: {
+            'model': {...},  # CF model artifacts
+            'embeddings': np.array,  # BERT embeddings
+            'compatibility': {...}  # Validation results
+        }
+    """
+    registry = load_registry_json('artifacts/cf/registry.json')
+    
+    # Determine model
+    if model_id is None:
+        model_id = registry['current_best']['model_id']
+    
+    # Determine embeddings
+    if embeddings_version is None:
+        if 'bert_integration' in registry['models'][model_id]:
+            embeddings_version = registry['models'][model_id]['bert_integration']['embeddings_version']
+        else:
+            # Use latest embeddings
+            embeddings_version = max(registry['bert_embeddings'].keys())
+    
+    # Load CF model
+    model = load_model_from_registry(model_id)
+    
+    # Load BERT embeddings
+    emb_path = registry['bert_embeddings'][embeddings_version]['files']['product_embeddings']
+    bert_data = torch.load(emb_path)
+    embeddings = bert_data['embeddings'].numpy()
+    
+    # Validate compatibility
+    compatibility = validate_model_embeddings_compatibility(model_id, embeddings_version)
+    
+    if not compatibility['compatible']:
+        for warning in compatibility['warnings']:
+            logger.warning(warning)
+    
+    return {
+        'model': model,
+        'embeddings': embeddings,
+        'embeddings_version': embeddings_version,
+        'compatibility': compatibility
+    }
+```
+
 ## Dependencies
 
 ```python
@@ -511,6 +753,9 @@ numpy>=1.23.0
 pandas>=1.5.0
 pyyaml>=6.0  # For config
 gitpython>=3.1.0  # For git commit hash
+
+# BERT artifacts
+torch>=1.13.0
 ```
 
 ## Timeline Estimate

@@ -14,13 +14,20 @@ Scheduler (Cron/Airflow)
 │   - Update preprocessed data
 │   - Check data quality
 │
-├─ Weekly: Drift Detection
+├─ Weekly: BERT Embeddings Refresh (Tuesday)
+│   - Regenerate PhoBERT embeddings
+│   - Update product_embeddings.pt
+│   - Register new version
+│   - Validate alignment
+│
+├─ Weekly: Drift Detection (Monday)
 │   - Rating distribution drift
 │   - Popularity shift
+│   - Semantic drift (BERT embeddings)
 │   - Alert if needed
 │
 ├─ Triggered: Model Retraining
-│   - ALS pipeline
+│   - ALS pipeline (with/without BERT init)
 │   - BPR pipeline
 │   - Evaluate both
 │   - Select best
@@ -28,12 +35,14 @@ Scheduler (Cron/Airflow)
 │
 ├─ Daily: Model Deployment
 │   - Check registry updates
+│   - Reload CF models + BERT embeddings
 │   - Hot-reload service
 │   - Validate serving
 │
 └─ Hourly: Health Checks
     - Service status
     - Metrics aggregation
+    - BERT embedding freshness
     - Alert on issues
 ```
 
@@ -329,12 +338,111 @@ if __name__ == '__main__':
     sys.exit(main())
 ```
 
-### Script 4: Health Check
+### Script 4: BERT Embeddings Refresh
+
+#### File: `scripts/refresh_bert_embeddings.py`
+```python
+"""
+Regenerate BERT embeddings cho updated product catalog.
+
+Usage:
+    python scripts/refresh_bert_embeddings.py \
+        --model vinai/phobert-base \
+        --output data/processed/content_based_embeddings/
+"""
+
+import argparse
+import os
+import sys
+import pandas as pd
+import torch
+from datetime import datetime
+from recsys.bert.embedding_generator import BERTEmbeddingGenerator
+from recsys.cf.registry import register_bert_embeddings
+from scripts.utils import setup_logger, send_alert, compute_data_hash
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', default='vinai/phobert-base')
+    parser.add_argument('--output', default='data/processed/content_based_embeddings/')
+    parser.add_argument('--product-file', default='data/published_data/data_product.csv')
+    args = parser.parse_args()
+    
+    logger = setup_logger('bert_refresh', 'logs/bert_refresh.log')
+    logger.info("BERT embeddings refresh started")
+    
+    try:
+        # Load products
+        products = pd.read_csv(args.product_file, encoding='utf-8')
+        logger.info(f"Loaded {len(products)} products")
+        
+        # Prepare text
+        products['combined_text'] = (
+            products['product_name'] + ' [SEP] ' +
+            products['brand'].fillna('') + ' [SEP] ' +
+            products['processed_description'].fillna('')
+        )
+        
+        # Generate embeddings
+        logger.info(f"Generating BERT embeddings using {args.model}...")
+        generator = BERTEmbeddingGenerator(model_name=args.model)
+        embeddings = generator.encode_texts(
+            products['combined_text'].tolist(),
+            batch_size=32,
+            show_progress=True
+        )
+        logger.info(f"Generated {len(embeddings)} embeddings of shape {embeddings.shape}")
+        
+        # Save
+        os.makedirs(args.output, exist_ok=True)
+        output_file = os.path.join(args.output, 'product_embeddings.pt')
+        generator.save_embeddings(
+            embeddings,
+            products['product_id'].tolist(),
+            output_file
+        )
+        logger.info(f"Saved embeddings to {output_file}")
+        
+        # Register in registry
+        metadata = {
+            'model_name': args.model,
+            'embedding_dim': embeddings.shape[1],
+            'num_products': len(embeddings),
+            'created_at': datetime.now().isoformat(),
+            'data_hash': compute_data_hash(products)
+        }
+        
+        version = register_bert_embeddings(output_file, metadata)
+        logger.info(f"Registered embeddings version: {version}")
+        
+        # Send notification
+        send_alert(
+            subject="BERT Embeddings Refreshed",
+            message=f"Generated {len(embeddings)} embeddings (version: {version})",
+            severity="info"
+        )
+        
+        return 0
+    
+    except Exception as e:
+        logger.error(f"Embedding refresh failed: {str(e)}", exc_info=True)
+        send_alert(
+            subject="BERT Embedding Refresh Failed",
+            message=f"Error: {str(e)}",
+            severity="critical"
+        )
+        return 1
+
+if __name__ == '__main__':
+    sys.exit(main())
+```
+
+### Script 5: Health Check (Enhanced with BERT)
 
 #### File: `scripts/health_check.py`
 ```python
 """
-Periodic health check cho service.
+Periodic health check cho service (including BERT embedding freshness).
 
 Usage:
     python scripts/health_check.py --service-url http://localhost:8000
@@ -346,11 +454,32 @@ import logging
 import sys
 import pandas as pd
 import sqlite3
+import os
+from datetime import datetime, timedelta
+
+def check_bert_embedding_freshness(logger, threshold_days=7):
+    """Check if BERT embeddings are up-to-date."""
+    embedding_file = 'data/processed/content_based_embeddings/product_embeddings.pt'
+    
+    if not os.path.exists(embedding_file):
+        logger.warning(f"BERT embedding file not found: {embedding_file}")
+        return False
+    
+    mod_time = datetime.fromtimestamp(os.path.getmtime(embedding_file))
+    age_days = (datetime.now() - mod_time).days
+    
+    if age_days > threshold_days:
+        logger.warning(f"BERT embeddings are {age_days} days old (threshold: {threshold_days})")
+        return False
+    
+    logger.info(f"BERT embeddings are fresh ({age_days} days old)")
+    return True
 
 def main():
     parser = argparse.ArgumentParser(description="Service health check")
     parser.add_argument('--service-url', default='http://localhost:8000')
     parser.add_argument('--alert-threshold', type=float, default=0.1, help='Error rate threshold')
+    parser.add_argument('--bert-freshness-days', type=int, default=7)
     args = parser.parse_args()
     
     logger = setup_logger('health_check', 'logs/health_check.log')
@@ -359,6 +488,15 @@ def main():
         # Check service alive
         health = requests.get(f"{args.service_url}/health", timeout=5).json()
         logger.info(f"Service healthy: {health}")
+        
+        # Check BERT embedding freshness
+        bert_fresh = check_bert_embedding_freshness(logger, args.bert_freshness_days)
+        if not bert_fresh:
+            send_alert(
+                subject="BERT Embeddings Stale",
+                message=f"Embeddings older than {args.bert_freshness_days} days. Consider refresh.",
+                severity="warning"
+            )
         
         # Check recent metrics
         conn = sqlite3.connect('logs/service_metrics.db')
@@ -414,6 +552,9 @@ if __name__ == '__main__':
 # Data refresh - Daily at 2am
 0 2 * * * cd /path/to/project && python scripts/refresh_data.py >> logs/cron_data_refresh.log 2>&1
 
+# BERT embeddings refresh - Weekly on Tuesday 3am
+0 3 * * 2 cd /path/to/project && python scripts/refresh_bert_embeddings.py >> logs/cron_bert_refresh.log 2>&1
+
 # Drift detection - Weekly on Monday 9am
 0 9 * * 1 cd /path/to/project && python scripts/detect_drift.py >> logs/cron_drift.log 2>&1
 
@@ -438,6 +579,11 @@ if __name__ == '__main__':
 $action = New-ScheduledTaskAction -Execute "python" -Argument "scripts/refresh_data.py" -WorkingDirectory "D:\app\IAI\project"
 $trigger = New-ScheduledTaskTrigger -Daily -At 2am
 Register-ScheduledTask -TaskName "CF_DataRefresh" -Action $action -Trigger $trigger
+
+# BERT Embeddings Refresh - Weekly Tuesday 3am
+$action = New-ScheduledTaskAction -Execute "python" -Argument "scripts/refresh_bert_embeddings.py" -WorkingDirectory "D:\app\IAI\project"
+$trigger = New-ScheduledTaskTrigger -Weekly -DaysOfWeek Tuesday -At 3am
+Register-ScheduledTask -TaskName "CF_BERTRefresh" -Action $action -Trigger $trigger
 
 # Model Training - Weekly Sunday 3am
 $action = New-ScheduledTaskAction -Execute "python" -Argument "scripts/train_both_models.py --auto-select" -WorkingDirectory "D:\app\IAI\project"

@@ -450,6 +450,288 @@ for u in users:
     top_k = cand_indices[np.argsort(cand_scores)[::-1][:k]]
 ```
 
+## Hybrid Metrics: CF + BERT Evaluation
+
+### 7. Diversity (Intra-List Diversity)
+
+#### Definition
+**Diversity** đo lường mức độ khác biệt giữa các items trong recommendation list.
+
+#### Formula (Content-Based)
+```
+Diversity = 1 - (1/K(K-1)) * ΣΣ similarity(i, j)  for i ≠ j
+```
+
+#### Implementation với BERT Embeddings
+```python
+def compute_diversity_bert(recommendations, bert_embeddings, item_to_idx):
+    """
+    Compute diversity using BERT embeddings.
+    
+    Args:
+        recommendations: List of product IDs
+        bert_embeddings: np.array (num_items, 768)
+        item_to_idx: Dict mapping product_id -> embedding idx
+    
+    Returns:
+        float: Diversity score [0, 1], higher = more diverse
+    """
+    if len(recommendations) < 2:
+        return 0.0
+    
+    # Get embeddings
+    embs = []
+    for product_id in recommendations:
+        if product_id in item_to_idx:
+            idx = item_to_idx[product_id]
+            embs.append(bert_embeddings[idx])
+    
+    if len(embs) < 2:
+        return 0.0
+    
+    embs = np.array(embs)
+    
+    # Normalize
+    embs_norm = embs / np.linalg.norm(embs, axis=1, keepdims=True)
+    
+    # Pairwise cosine similarities
+    similarities = []
+    for i in range(len(embs_norm)):
+        for j in range(i+1, len(embs_norm)):
+            sim = np.dot(embs_norm[i], embs_norm[j])
+            similarities.append(sim)
+    
+    # Diversity = 1 - avg similarity
+    avg_similarity = np.mean(similarities)
+    diversity = 1 - avg_similarity
+    
+    return diversity
+```
+
+#### Interpretation
+- **Diversity = 0.3**: Items trong list tương đối similar (avg similarity = 0.7)
+- **Diversity = 0.6**: Items khá diverse (avg similarity = 0.4)
+- **Trade-off**: High diversity có thể giảm accuracy (recommend less similar items)
+
+### 8. Semantic Alignment Score
+
+#### Definition
+Đo lường mức độ CF recommendations align với user content preferences.
+
+#### Formula
+```
+Alignment = (1/K) * Σ cosine_similarity(user_profile_bert, item_bert_i)
+```
+
+#### Implementation
+```python
+def compute_semantic_alignment(user_profile_emb, recommendations, item_embeddings, item_to_idx):
+    """
+    Đo semantic alignment của CF recommendations với user BERT profile.
+    """
+    # Normalize user profile
+    user_norm = user_profile_emb / np.linalg.norm(user_profile_emb)
+    
+    similarities = []
+    for product_id in recommendations:
+        if product_id in item_to_idx:
+            idx = item_to_idx[product_id]
+            item_emb = item_embeddings[idx]
+            item_norm = item_emb / np.linalg.norm(item_emb)
+            sim = np.dot(user_norm, item_norm)
+            similarities.append(sim)
+    
+    return np.mean(similarities) if similarities else 0.0
+```
+
+#### Use Case
+- **Evaluate CF quality**: CF recommendations có semantically relevant không?
+- **Compare models**: BERT-init ALS có higher alignment với user preferences không?
+
+### 9. Cold-Start Coverage
+
+#### Definition
+% cold-start items được recommend ít nhất 1 lần.
+
+#### Formula
+```
+ColdStartCoverage = |Unique Cold Items in All Recs| / |Total Cold Items|
+```
+
+#### Implementation
+```python
+def compute_cold_start_coverage(all_recommendations, item_counts, cold_threshold=5):
+    """
+    Coverage của cold-start items.
+    
+    Args:
+        all_recommendations: Dict {user_id: [product_ids]}
+        item_counts: Series với item interaction counts
+        cold_threshold: Items với <N interactions = cold
+    
+    Returns:
+        float: Coverage [0, 1]
+    """
+    # Identify cold items
+    cold_items = set(item_counts[item_counts < cold_threshold].index)
+    
+    # Collect recommended cold items
+    recommended_cold = set()
+    for recs in all_recommendations.values():
+        recommended_cold.update([pid for pid in recs if pid in cold_items])
+    
+    coverage = len(recommended_cold) / len(cold_items) if cold_items else 0.0
+    return coverage
+```
+
+### Hybrid Evaluation Workflow
+
+#### Function: `evaluate_hybrid_model(U, V, bert_embeddings, test_data, user_profiles, k_values)`
+
+```python
+def evaluate_hybrid_model(U, V, bert_embeddings, item_to_idx, 
+                          test_data, user_profiles, k_values=[10, 20]):
+    """
+    Comprehensive evaluation: CF metrics + hybrid metrics.
+    
+    Returns:
+        dict: {
+            # Standard CF metrics
+            'recall@10': float,
+            'ndcg@10': float,
+            'coverage': float,
+            
+            # Hybrid metrics
+            'diversity@10': float,
+            'semantic_alignment@10': float,
+            'cold_start_coverage': float,
+            
+            # Per-user stats
+            'diversity_std': float,
+            'alignment_std': float
+        }
+    """
+    results = {}
+    
+    # Standard CF evaluation
+    cf_metrics = evaluate_model(U, V, test_data, k_values)
+    results.update(cf_metrics)
+    
+    # Generate recommendations for diversity/alignment
+    test_users = test_data['u_idx'].unique()
+    all_recommendations = {}
+    user_diversity = []
+    user_alignment = []
+    
+    for u in test_users:
+        scores = U[u] @ V.T
+        top_k = np.argsort(scores)[::-1][:max(k_values)]
+        product_ids = [idx_to_product[i] for i in top_k]
+        all_recommendations[u] = product_ids
+        
+        # Diversity
+        div = compute_diversity_bert(product_ids[:10], bert_embeddings, item_to_idx)
+        user_diversity.append(div)
+        
+        # Semantic alignment
+        if u in user_profiles:
+            align = compute_semantic_alignment(
+                user_profiles[u], product_ids[:10], bert_embeddings, item_to_idx
+            )
+            user_alignment.append(align)
+    
+    # Aggregate
+    results['diversity@10'] = np.mean(user_diversity)
+    results['diversity_std'] = np.std(user_diversity)
+    results['semantic_alignment@10'] = np.mean(user_alignment) if user_alignment else 0.0
+    results['alignment_std'] = np.std(user_alignment) if user_alignment else 0.0
+    
+    # Cold-start coverage
+    item_counts = compute_item_counts(test_data)
+    results['cold_start_coverage'] = compute_cold_start_coverage(
+        all_recommendations, item_counts, cold_threshold=5
+    )
+    
+    return results
+```
+
+### Comparison: CF vs CF+BERT Reranking
+
+#### Evaluation Script: `scripts/compare_cf_hybrid.py`
+
+```python
+"""
+Compare pure CF vs CF+BERT hybrid reranking.
+
+Usage:
+    python scripts/compare_cf_hybrid.py \
+        --cf-model artifacts/cf/als/v2_20250116_141500 \
+        --bert-embeddings data/processed/content_based_embeddings/product_embeddings.pt
+"""
+
+import argparse
+import pandas as pd
+from recsys.cf.metrics import evaluate_hybrid_model
+
+def main():
+    # Load CF model
+    U, V = load_cf_model(args.cf_model)
+    
+    # Load BERT embeddings
+    bert_data = torch.load(args.bert_embeddings)
+    bert_embeddings = bert_data['embeddings'].numpy()
+    
+    # Load test data
+    test_data = load_test_data()
+    
+    # Evaluate pure CF
+    print("Evaluating Pure CF...")
+    cf_results = evaluate_hybrid_model(U, V, bert_embeddings, test_data, user_profiles=None)
+    
+    # Evaluate CF + BERT reranking
+    print("Evaluating CF + BERT Reranking...")
+    # Generate user profiles
+    user_profiles = compute_all_user_profiles(test_data, bert_embeddings)
+    
+    # Rerank CF recommendations
+    hybrid_results = evaluate_with_reranking(U, V, bert_embeddings, test_data, user_profiles)
+    
+    # Compare
+    comparison = pd.DataFrame({
+        'Pure CF': cf_results,
+        'CF + BERT': hybrid_results,
+        'Improvement': {k: (hybrid_results[k] - cf_results[k]) / cf_results[k] * 100 
+                        for k in cf_results.keys()}
+    }).T
+    
+    print("\nComparison:")
+    print(comparison)
+    
+    # Save report
+    comparison.to_csv('reports/cf_vs_hybrid_comparison.csv')
+
+if __name__ == '__main__':
+    main()
+```
+
+#### Expected Results
+
+```
+Metric                  | Pure CF | CF + BERT | Improvement
+------------------------|---------|-----------|------------
+recall@10               | 0.245   | 0.252     | +2.9%
+ndcg@10                 | 0.195   | 0.208     | +6.7%
+coverage                | 0.310   | 0.298     | -3.9%
+diversity@10            | 0.352   | 0.418     | +18.8%
+semantic_alignment@10   | 0.412   | 0.531     | +28.9%
+cold_start_coverage     | 0.087   | 0.142     | +63.2%
+```
+
+**Insights**:
+- Hybrid reranking improves **diversity** (+18.8%) và **semantic alignment** (+28.9%)
+- **Cold-start coverage** tăng đáng kể (+63.2%) do BERT embeddings cho cold items
+- Trade-off: Coverage giảm nhẹ (-3.9%) vì reranking prioritize quality over popularity
+
 ## Dependencies
 
 ```python
@@ -460,6 +742,9 @@ scipy>=1.9.0  # For statistical tests
 scikit-learn>=1.2.0  # For metrics utilities
 matplotlib>=3.6.0  # For plotting
 seaborn>=0.12.0  # For nice plots
+
+# BERT evaluation
+torch>=1.13.0
 ```
 
 ## Module Documentation
