@@ -1,0 +1,54 @@
+# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Virtual environments
+venv/
+env/
+ENV/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Processed data (large files)
+data/processed/*.parquet
+data/processed/*.npz
+data/processed/*.pkl
+data/processed/*.npy
+
+# Keep structure files
+!data/processed/.gitkeep
+!data/processed/*.json
+!data/processed/*.yaml
+
+# Logs
+logs/*.log
+logs/*.txt
+
+# Model artifacts
+model/checkpoints/
+model/saved_models/
+artifacts/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+*.cover
+
+# Documentation build
+docs/_build/
