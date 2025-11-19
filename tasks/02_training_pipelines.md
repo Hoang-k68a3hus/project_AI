@@ -4,6 +4,38 @@
 
 Xây dựng hai pipelines huấn luyện Collaborative Filtering song song: ALS (Alternating Least Squares) và BPR (Bayesian Personalized Ranking). Mỗi pipeline sẽ train, evaluate, và persist artifacts độc lập, sau đó được so sánh để chọn best model.
 
+## 🔄 Updated Training Strategy (November 2025)
+
+### Data Context: High Sparsity + Rating Skew
+- **Sparsity**: ~1.23 interactions/user → Most users are one-time buyers
+- **Rating Skew**: ~95% are 5-star → Loss of discriminative power
+- **Challenge**: Traditional CF struggles with minimal user overlap
+
+### Key Changes from Task 01 Data Layer Updates:
+
+1. **User Segmentation**
+   - Train CF only on **trainable users** (≥3 interactions)
+   - Skip cold-start users (1-2 interactions) - serve them with content-based
+   - Result: Higher quality training data, better model convergence
+
+2. **ALS: Sentiment-Enhanced Confidence**
+   - Input: Confidence matrix (rating + comment_quality, range 1.0-6.0)
+   - Distinguishes "genuine 5-star" from "bare 5-star"
+   - Lower alpha scaling (5-10) due to higher confidence range
+
+3. **BPR: Dual Hard Negative Mining**
+   - Explicit: Low ratings (≤3) when available
+   - Implicit: Top-50 popular items user didn't buy
+   - Sampling: 30% hard negatives (mixed) + 70% random unseen
+   - Improved ranking for sparse data
+
+4. **Test Set: Trainable Users Only**
+   - Evaluate CF models only on trainable users
+   - Cold-start users evaluated separately on content-based metrics
+   - Fair comparison of CF effectiveness
+
+
+
 ## Pipeline Overview
 
 ```
@@ -35,11 +67,15 @@ Preprocessed Data (từ Task 01)
 - **Functions**:
   - `load_processed_data(version)` → dict với matrices, mappings, splits
 - **Outputs**:
-  - `X_train`: CSR matrix (num_users, num_items)
-  - `user_pos_train`: Dict[u_idx, Set[i_idx]]
-  - `test_interactions`: DataFrame với held-out positives
+  - `X_train_confidence`: CSR matrix với confidence scores (1-6) for ALS - **trainable users only**
+  - `X_train_binary`: CSR matrix với binary values (optional) for BPR - **trainable users only**
+  - `user_pos_train`: Dict[u_idx, Set[i_idx]] - positive interactions (trainable users)
+  - `user_hard_neg_train`: Dict[u_idx, Dict["explicit"|"implicit", Set[i_idx]]] - dual hard negatives
+  - `test_interactions`: DataFrame với held-out positives from **trainable users only**
+  - `user_metadata`: Segmentation data (trainable vs cold-start users)
   - `mappings`: User/item ID mappings
-  - `item_popularity`: Array cho baseline
+  - `top_k_popular_items`: Top-50 popular item indices for implicit negatives
+  - `item_popularity`: Log-transformed popularity array
 
 ### 2. Configuration Management
 - **File**: `config/training_config.yaml`
@@ -49,9 +85,10 @@ Preprocessed Data (từ Task 01)
     factors: 64
     regularization: 0.01
     iterations: 15
-    alpha: 40  # Confidence scaling
+    alpha: 10  # Confidence scaling (LOWER than binary: 10 vs 40)
     use_gpu: false
     random_seed: 42
+    confidence_strategy: "direct"  # "direct" or "scaled"
   
   bpr:
     factors: 64
@@ -59,7 +96,8 @@ Preprocessed Data (từ Task 01)
     regularization: 0.0001
     epochs: 50
     samples_per_epoch: 5  # Multiple của số positives
-    negative_sampling: "uniform"  # or "popularity"
+    negative_sampling: "hard_mixed"  # "hard_mixed", "uniform", or "popularity"
+    hard_negative_ratio: 0.3  # 30% hard negatives, 70% random
     random_seed: 42
   
   evaluation:
@@ -77,23 +115,35 @@ Preprocessed Data (từ Task 01)
 
 ## ALS Pipeline
 
-### Step 1: Matrix Preparation
+### Step 1: Matrix Preparation (UPDATED: Sentiment-Enhanced Confidence)
 
-#### 1.1 Load Preprocessed CSR Matrix
-- **Input**: `X_train.npz` từ Task 01
-- **Shape**: (num_users, num_items)
-- **Values**: Binary (1 for positives) hoặc counts
+#### 1.1 Load Confidence Matrix
+- **Input**: `X_train_confidence.npz` từ Task 01
+- **Shape**: (num_trainable_users, num_items)
+- **Values**: Confidence scores (1.0-6.0) = rating + comment_quality
+  - Range breakdown:
+    - [1.0-2.0]: Low ratings with/without quality comments
+    - [3.0-4.0]: Medium ratings with variable comment quality
+    - [5.0-6.0]: High ratings, 6.0 indicates genuine enthusiasm (detailed review)
+- **Rationale**: Combat 95% 5-star skew by incorporating review sentiment
+- **Coverage**: Only trainable users (≥3 interactions) - better model quality
 
-#### 1.2 Confidence Matrix Construction
-- **Formula**: `C = 1 + alpha * X_train`
-- **Intuition**: 
-  - Observed positives → high confidence (1 + alpha)
-  - Unobserved (zeros) → low confidence (1)
-- **Default alpha**: 40 (tune trong range 20-80)
+#### 1.2 Confidence Scaling Strategy
+- **Option 1 (Direct)**: Use confidence scores directly
+  - `C[u,i] = confidence_score` if observed
+  - `C[u,i] = 1` for unobserved (low confidence baseline)
+  
+- **Option 2 (Scaled - Recommended)**: Apply moderate alpha scaling
+  - `C = 1 + alpha * (confidence - 1) / 5` (normalize to [0,1] first)
+  - Default alpha: **5-10** (much lower than binary case 40 due to richer signal)
+  - Higher confidence values already encode quality
 
-#### 1.3 Preference Matrix
-- **P**: Binary matrix (1 where X > 0, else 0)
-- **Usage**: Ground truth preferences trong ALS loss
+#### 1.3 Preference Matrix (Optional)
+- **P**: Can derive binary preference from confidence
+  - P[u,i] = 1 if confidence >= threshold (e.g., 4.5), else 0
+  - Or continuous: P[u,i] = (confidence - 1) / 5 (normalize to [0,1])
+- **Usage**: Target preferences trong ALS loss
+- **Note**: With sentiment-enhanced confidence, ALS learns nuanced preferences beyond binary
 
 ### Step 2: Model Initialization
 
@@ -229,13 +279,29 @@ model = AlternatingLeastSquares(
   }
   ```
 
-#### 7.4 Metadata
+#### 7.4 Metadata (UPDATED - Add Score Range for Global Normalization)
 - **File**: `als_metadata.json`
 - **Content**:
   - Timestamp huấn luyện
   - Data version hash (từ Task 01)
   - Git commit hash (code version)
   - System info (CPU/GPU, memory)
+  - **NEW - CF Score Range** (Critical for Task 08 normalization):
+    ```json
+    {
+      "score_range": {
+        "method": "validation_set",
+        "min": 0.0,
+        "max": 1.48,
+        "mean": 0.32,
+        "std": 0.21,
+        "p01": 0.01,
+        "p99": 1.12
+      }
+    }
+    ```
+  - **Computation**: Run U @ V.T on validation set, compute percentiles
+  - **Purpose**: Enable global normalization in hybrid reranking (Task 08)
 
 ## BPR Pipeline
 
@@ -249,26 +315,56 @@ model = AlternatingLeastSquares(
 - **Format**: List of tuples `(u_idx, i_idx)` for all train positives
 - **Size**: ~369K pairs (after filtering)
 
-### Step 2: Negative Sampling Strategy
+### Step 2: Dual Hard Negative Mining Strategy (UPDATED)
 
-#### 2.1 Uniform Sampling
-- **Method**: 
-  - For each (u, i+), sample j- uniformly từ [0, num_items-1]
-  - Reject nếu j- in `user_pos_train[u]` → resample
-- **Pros**: Simple, unbiased
-- **Cons**: Nhiều "easy" negatives (user không hứng thú)
+#### 2.1 Hard Negative Sampling - Explicit + Implicit (PRIMARY)
+- **Load hard negatives**: `user_hard_neg_train` with structure:
+  ```python
+  {
+    u_idx: {
+      "explicit": set([i_idx1, i_idx2]),  # Items with rating ≤3
+      "implicit": set([i_idx3, i_idx4])   # Popular items user didn't buy
+    }
+  }
+  ```
 
-#### 2.2 Popularity-Biased Sampling (Advanced)
-- **Method**: 
-  - Sample j- theo `item_popularity` distribution
-  - Higher chance cho popular items
-- **Pros**: Harder negatives, better ranking
-- **Cons**: Slower, need tuned popularity exponent
+- **Sampling Strategy**:
+  - For each (u, i+), sample j- from mix:
+    - 15% from `explicit` hard negatives (if available)
+    - 15% from `implicit` hard negatives (popular items not bought)
+    - 70% uniform random from unseen items
+  - Reject if j- in `user_pos_train[u]` → resample
 
-#### 2.3 Samples Per Epoch
+- **Rationale**: 
+  - **Explicit negatives**: "You bought this but hated it" - strong signal
+  - **Implicit negatives**: "Everyone bought this but you didn't" - preference signal
+  - **Random negatives**: Maintain diversity, avoid over-focusing on hard cases
+
+#### 2.2 Implicit Negative Generation Details
+- **Source**: `top_k_popular_items` (Top-50 from Task 01)
+- **Logic**: For each trainable user, find popular items NOT in their history
+  ```python
+  implicit_negs = set(top_k_popular_items) - user_pos_train[u] - user_hard_neg_train[u]["explicit"]
+  ```
+- **Why effective for sparse data**: 
+  - Popular items have high probability of being relevant
+  - User NOT buying them signals negative preference
+  - More informative than random unpopular items
+
+#### 2.3 Fallback Strategy
+- **For users without hard negatives**: 
+  - Use 30% popularity-biased sampling + 70% uniform random
+  - Popularity-biased: Sample from log-transformed `item_popularity` distribution
+
+#### 2.4 Samples Per Epoch
 - **Rule**: `samples_per_epoch = num_positives * multiplier`
 - **Default multiplier**: 5 (balance coverage vs speed)
-- **Total samples**: ~1.8M triplets per epoch với multiplier=5
+- **Total samples**: ~1.8M triplets per epoch with multiplier=5
+- **Tracking metrics**:
+  - % triplets using explicit hard negatives
+  - % triplets using implicit hard negatives
+  - % triplets using random negatives
+  - Average hard negative quality score
 
 ### Step 3: Model Initialization
 
@@ -358,26 +454,43 @@ for epoch in range(epochs):
   - `bpr_U.npy`, `bpr_V.npy`
   - `bpr_params.json`
   - `bpr_metrics.json`
-  - `bpr_metadata.json`
+  - `bpr_metadata.json` (UPDATED - Add Score Range)
 
 #### 7.2 Additional BPR-Specific Metadata
 - **Sampling config**: uniform/popularity, samples_per_epoch
 - **Convergence**: Epoch tốt nhất (early stopping)
 - **Training curves**: Loss và metrics theo epoch (CSV hoặc JSON)
+- **NEW - CF Score Range** (Critical for Task 08 normalization):
+  ```json
+  {
+    "score_range": {
+      "method": "validation_set",
+      "min": -0.35,
+      "max": 1.62,
+      "mean": 0.48,
+      "std": 0.28,
+      "p01": -0.12,
+      "p99": 1.38
+    }
+  }
+  ```
+- **Computation**: Run dot(U[user], V[items]) on validation set, compute percentiles
+- **Purpose**: Enable global normalization in hybrid reranking (Task 08)
 
 ## Hyperparameter Tuning
 
 ### Grid Search Strategy
 
-#### 1. ALS Grid
+#### 1. ALS Grid (UPDATED for ≥2 Threshold)
 ```yaml
 factors: [32, 64, 128]
-regularization: [0.001, 0.01]
+regularization: [0.01, 0.05, 0.1]  # Higher for sparse data (≥2 threshold)
 iterations: [10, 20]
-alpha: [20, 40, 80]
+alpha: [5, 10, 20]  # Lower alpha due to sentiment-enhanced confidence (1-6 range)
 ```
-- **Total combinations**: 3×2×2×3 = 36 configs
+- **Total combinations**: 3×3×2×3 = 54 configs
 - **Parallel**: Có thể train parallel nếu có resources
+- **Rationale**: Higher regularization (λ=0.1) anchors sparse user vectors to BERT semantic space
 
 #### 2. BPR Grid
 ```yaml
@@ -391,10 +504,11 @@ epochs: [30, 50]  # With early stopping
 
 ### Tuning Workflow
 
-#### Stage 1: Coarse Search
+#### Stage 1: Coarse Search (UPDATED for ≥2 Threshold)
 - **ALS**: 
-  - Fix iterations=15, alpha=40
-  - Tune factors={32,64,128}, reg={0.01, 0.1}
+  - Fix iterations=15, alpha=10 (lower due to confidence_score range 1-6)
+  - Tune factors={32,64,128}, reg={0.05, 0.1, 0.15}
+  - **Critical**: Higher reg anchors BERT initialization for sparse users (≥2 interactions)
 - **BPR**:
   - Fix epochs=30
   - Tune factors={64}, lr={0.01,0.05,0.1}, reg={1e-4,1e-3}
@@ -503,6 +617,8 @@ python scripts/train_cf.py \
 
 #### Purpose
 Khởi tạo ALS/BPR item embeddings từ BERT embeddings để transfer semantic knowledge.
+
+**CRITICAL for ≥2 Threshold**: With ~26k trainable users (≥2 interactions) and matrix density ~0.11%, BERT initialization is essential. Higher regularization (λ=0.1) prevents user vectors from drifting too far from semantic space, especially for users with exactly 2 interactions.
 
 #### Implementation: ALS with BERT Init
 

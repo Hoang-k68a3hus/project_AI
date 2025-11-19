@@ -4,6 +4,50 @@
 
 Kết hợp Collaborative Filtering (ALS/BPR) với PhoBERT embeddings và product attributes để tạo hệ thống hybrid recommendation. Mục tiêu là tăng diversity, personalization, và handle cold-start tốt hơn bằng cách combine multiple signals.
 
+## 📊 Data Dependencies (Updated November 2025)
+
+**Critical**: This task depends on enriched metadata from Task 01:
+- **Input File**: `data/processed/product_attributes_enriched.parquet`
+- **Pre-computed Signals**:
+  - `popularity_score`: Log-transformed `num_sold_time` → ready for normalization
+  - `quality_score`: Derived from review ratings (avg_rating, pct_5star)
+  - `skin_type_standardized`: List of standardized tags for hard filtering
+- **BERT Embeddings**: `data/processed/content_based_embeddings/product_embeddings.pt` with rich text context
+
+**Benefit**: Không cần compute log-transform hoặc aggregate ratings on-the-fly, tất cả đã được chuẩn bị sẵn trong pipeline Task 01.
+
+## 🎯 Content-First Hybrid Strategy (Updated for Sparsity)
+
+### Context
+- **Data sparsity**: ~1.23 interactions/user → CF has limited collaborative signal
+- **Trainable users**: ~26,000 (8.6%) with ≥2 interactions; ~274,000 (91.4%) cold-start
+- **Solution**: Shift weight from CF to content-based (PhoBERT) for more reliable recommendations
+
+### Recommended Weight Distribution
+```yaml
+# For Trainable Users (≥2 interactions, ~8.6% traffic)
+weights_trainable:
+  content: 0.40    # PRIMARY - Semantic similarity (PhoBERT)
+  cf: 0.30         # SECONDARY - Collaborative signal (ALS/BPR with BERT init)
+  popularity: 0.20 # TERTIARY - Trending/popular items
+  quality: 0.10    # BONUS - High-rated products
+
+# For Cold-Start Users (1 interaction or new, ~91.4% traffic)
+weights_cold_start:
+  content: 0.60    # DOMINANT - Only reliable signal
+  popularity: 0.30 # Social proof
+  quality: 0.10    # High-rated products
+  # cf: 0.0        # Skipped - no user embedding
+```
+
+**Rationale**:
+- **Trainable users**: Content (40%) most reliable despite ≥2 threshold; CF (30%) still valuable with BERT init + higher regularization (λ=0.1)
+- **Cold-start users** (majority): Content (60%) dominant; CF unusable
+- Popularity (20-30%): Social proof, handles trending items
+- Quality (10%): Bonus for highly-rated products
+
+**Critical**: With 91.4% traffic using cold-start path, content-based infrastructure must be optimized for latency.
+
 ## Hybrid Strategy Overview
 
 ```
@@ -16,9 +60,9 @@ Top-K Candidates (e.g., K=50)
 Reranking Layer (PhoBERTEmbeddingLoader from Task 05)
     ↓
 ├─ Content Similarity (PhoBERT cosine similarity)
-├─ Popularity Signal (num_sold_time)
-├─ Quality Signal (avg_star)
-├─ Attribute Match (brand, skin_type)
+├─ Popularity Signal (log-transformed popularity_score from Task 01)
+├─ Quality Signal (quality_score / avg_rating from Task 01)
+├─ Attribute Match (brand, skin_type_standardized)
 └─ Diversity Boost (intra-list diversity)
     ↓
 Weighted Combination
@@ -28,6 +72,7 @@ Final Top-K (e.g., K=10)
 
 **Key Integration Points**:
 - **PhoBERTEmbeddingLoader** (Task 05): Handles BERT embedding loading, user profile computation, and cosine similarity scoring
+- **Enriched Metadata** (Task 01): Uses `product_attributes_enriched.parquet` with standardized attributes and pre-computed auxiliary signals
 - **Diversity Metrics** (Task 03): `compute_diversity_bert()` evaluates intra-list diversity using BERT embeddings
 - **Semantic Alignment** (Task 03): `compute_semantic_alignment()` measures user profile → recommendation relevance
 - **Model Registry** (Task 04): Tracks BERT embedding versions and compatibility with CF models
@@ -199,21 +244,52 @@ class HybridReranker:
         self.phobert = phobert_embeddings
         self.metadata = item_metadata
         
-        # Default weights (tuned using Task 03 evaluation metrics)
+        # Default weights (UPDATED for sparse data - content-first strategy)
         self.config = config or {
             'weights': {
-                'cf': 0.5,          # Collaborative filtering score
-                'content': 0.2,     # PhoBERT cosine similarity
-                'popularity': 0.15, # Normalized num_sold_time
-                'quality': 0.15     # Normalized avg_star
+                'content': 0.40,    # PRIMARY - PhoBERT semantic similarity
+                'cf': 0.30,         # SECONDARY - Collaborative filtering score
+                'popularity': 0.20, # TERTIARY - Log-transformed popularity
+                'quality': 0.10     # BONUS - Quality score from reviews
             },
             'diversity': {
                 'enabled': True,
                 'penalty': 0.1,      # Penalty cho similar items
                 'threshold': 0.9     # BERT similarity threshold
             },
-            'user_profile_strategy': 'weighted_mean'  # From Task 01: weighted_mean, tf_idf, recency
+            'user_profile_strategy': 'weighted_mean',  # From Task 01: weighted_mean, tf_idf, recency
+            'adaptive_weights': True,  # Adjust weights based on user interaction count
+            
+            # CRITICAL: Global normalization ranges (NOT local per-request)
+            'normalization': {
+                'cf': {
+                    'method': 'clip',  # 'clip' or 'minmax'
+                    'min': 0.0,
+                    'max': 1.5,  # ALS/BPR scores typically in [0, 1.5] after U@V.T
+                    'clip': True  # Hard clip to prevent outliers
+                },
+                'content': {
+                    'method': 'clip',
+                    'min': -1.0,  # Cosine similarity range
+                    'max': 1.0,
+                    'clip': True
+                },
+                'popularity': {
+                    'method': 'percentile',  # Use pre-computed percentiles from Task 01
+                    'p99': None,  # Will be loaded from metadata
+                    'p01': None
+                },
+                'quality': {
+                    'method': 'fixed',
+                    'min': 1.0,  # Rating range
+                    'max': 5.0,
+                    'clip': True
+                }
+            }
         }
+        
+        # Load global statistics for normalization (from Task 01 processed data)
+        self._load_global_stats()
 
 ##### Method 1: `rerank(cf_recommendations, user_id, user_history=None)`
 ```python
@@ -306,32 +382,81 @@ def _compute_signals(self, candidate_ids, user_history=None):
         # Fallback: no content signal
         signals['content'] = {cid: 0.0 for cid in candidate_ids}
     
-    # Popularity
+    # Popularity (log-transformed from Task 01)
     signals['popularity'] = {}
     for cid in candidate_ids:
         product = self.metadata[self.metadata['product_id'] == cid]
         if not product.empty:
-            signals['popularity'][cid] = float(product.iloc[0]['num_sold_time'])
+            # Use pre-computed log-transformed popularity from Task 01
+            signals['popularity'][cid] = float(product.iloc[0].get('popularity_score', 0.0))
         else:
             signals['popularity'][cid] = 0.0
     
-    # Quality (avg_star)
+    # Quality (pre-computed from Task 01: quality_score, avg_rating, pct_5star)
     signals['quality'] = {}
     for cid in candidate_ids:
         product = self.metadata[self.metadata['product_id'] == cid]
         if not product.empty:
-            signals['quality'][cid] = float(product.iloc[0].get('avg_star', 3.0))
+            # Prefer quality_score from Task 01, fallback to avg_rating
+            signals['quality'][cid] = float(product.iloc[0].get('quality_score', 
+                                              product.iloc[0].get('avg_rating', 3.0)))
         else:
             signals['quality'][cid] = 3.0
     
     return signals
 ```
 
-##### Method 3: `_normalize_signals(signals)`
+##### Method 0: `_load_global_stats()` (NEW - Critical for Global Normalization)
+```python
+def _load_global_stats(self):
+    """
+    Load global statistics for normalization from Task 01 processed data.
+    
+    This prevents local normalization issues where different requests
+    get incomparable normalized scores.
+    """
+    # Load data_stats.json from Task 01
+    try:
+        with open('data/processed/data_stats.json', 'r') as f:
+            stats = json.load(f)
+        
+        # Extract global ranges for normalization
+        if 'popularity' in stats:
+            self.config['normalization']['popularity']['p99'] = stats['popularity'].get('p99', 10.0)
+            self.config['normalization']['popularity']['p01'] = stats['popularity'].get('p01', 0.0)
+        
+        # CF score range (optional - can be computed from model validation)
+        if 'cf_score_range' in stats:
+            self.config['normalization']['cf']['max'] = stats['cf_score_range']['max']
+            self.config['normalization']['cf']['min'] = stats['cf_score_range']['min']
+        
+        print("Loaded global normalization statistics")
+        
+    except FileNotFoundError:
+        print("Warning: data_stats.json not found. Using default normalization ranges.")
+        # Use hardcoded defaults from config
+        pass
+```
+
+##### Method 3: `_normalize_signals(signals)` (UPDATED - Global Normalization)
 ```python
 def _normalize_signals(self, signals):
     """
-    Normalize all signals to [0, 1] range.
+    Normalize all signals to [0, 1] range using GLOBAL statistics.
+    
+    CRITICAL FIX: Uses pre-defined global ranges instead of local min/max
+    to ensure consistent normalization across different requests.
+    
+    Problem with old approach:
+    - User A gets [0.91, ..., 0.99] → normalized to [0.0, ..., 1.0]
+    - User B gets [0.11, ..., 0.19] → normalized to [0.0, ..., 1.0]
+    - Both look equally good despite User A's scores being much higher!
+    
+    New approach:
+    - Use global ranges (e.g., CF scores in [0, 1.5])
+    - User A: [0.91/1.5, ..., 0.99/1.5] = [0.61, ..., 0.66]
+    - User B: [0.11/1.5, ..., 0.19/1.5] = [0.07, ..., 0.13]
+    - Now correctly reflects quality difference!
     
     Args:
         signals: Dict of signal dicts
@@ -342,16 +467,56 @@ def _normalize_signals(self, signals):
     normalized = {}
     
     for signal_name, scores in signals.items():
+        if signal_name not in self.config['normalization']:
+            # No normalization config → skip or use identity
+            normalized[signal_name] = scores
+            continue
+        
+        norm_config = self.config['normalization'][signal_name]
+        method = norm_config['method']
+        
         values = np.array(list(scores.values()))
         
-        # Min-max normalization
-        min_val = values.min()
-        max_val = values.max()
+        if method == 'clip':
+            # Hard clip to global range
+            min_val = norm_config['min']
+            max_val = norm_config['max']
+            
+            # Clip outliers
+            if norm_config.get('clip', True):
+                values = np.clip(values, min_val, max_val)
+            
+            # Normalize to [0, 1]
+            if max_val > min_val:
+                norm_values = (values - min_val) / (max_val - min_val)
+            else:
+                norm_values = np.zeros_like(values)
         
-        if max_val > min_val:
+        elif method == 'percentile':
+            # Use pre-computed percentiles (e.g., for popularity)
+            p01 = norm_config.get('p01', 0.0)
+            p99 = norm_config.get('p99', 1.0)
+            
+            if p99 > p01:
+                # Clip to percentile range and normalize
+                values_clipped = np.clip(values, p01, p99)
+                norm_values = (values_clipped - p01) / (p99 - p01)
+            else:
+                norm_values = np.zeros_like(values)
+        
+        elif method == 'fixed':
+            # Fixed range (e.g., ratings 1-5)
+            min_val = norm_config['min']
+            max_val = norm_config['max']
+            
+            if norm_config.get('clip', True):
+                values = np.clip(values, min_val, max_val)
+            
             norm_values = (values - min_val) / (max_val - min_val)
+        
         else:
-            norm_values = np.zeros_like(values)
+            # Fallback: identity (no normalization)
+            norm_values = values
         
         # Map back to product_ids
         normalized[signal_name] = {

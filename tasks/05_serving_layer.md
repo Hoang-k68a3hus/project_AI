@@ -2,7 +2,42 @@
 
 ## Mục Tiêu
 
-Xây dựng service layer để serve recommendations trong production, bao gồm model loading, recommendation generation, cold-start handling, filtering logic, và optional API endpoints. Service phải đảm bảo latency thấp, reliability cao, và dễ dàng integration.
+Xây dựng service layer để serve recommendations trong production, bao gồm model loading, recommendation generation, **user segmentation routing**, cold-start handling, filtering logic, và optional API endpoints. Service phải đảm bảo latency thấp, reliability cao, và dễ dàng integration.
+
+## 🔄 Updated Serving Strategy (November 2025)
+
+### Context: High Sparsity Data (~1.23 interactions/user, Updated ≥2 Threshold)
+- **Trainable users** (≥2 interactions): ~26,000 users (~8.6% of total) → Serve with CF (ALS/BPR) + reranking
+- **Cold-start users** (1 interaction or new): ~274,000 users (~91.4%) → Serve with content-based + popularity
+- **Routing decision**: Load `user_metadata.pkl` to check `is_trainable_user` flag
+- **Key insight**: 90%+ traffic will use content-based; CF is for the minority with ≥2 interactions
+
+### Serving Flow by User Type:
+
+```
+User Request
+    ↓
+Check user_metadata
+    ↓
+├─ Trainable User? (≥2 interactions + ≥1 positive)
+│  ├─ CF Recommender (ALS/BPR)
+│  ├─ Generate Top-K candidates
+│  ├─ Hybrid Reranking (CF + Content + Popularity)
+│  └─ Return personalized results (~8.6% of traffic)
+│
+└─ Cold-Start User? (1 interaction or new user)
+   ├─ Skip CF (no reliable user embedding)
+   ├─ Item-Item Similarity (PhoBERT)
+   │  └─ Find similar products to user's purchase history
+   ├─ Mix with Popularity (Top sellers)
+   └─ Return content-based + popular results (~91.4% of traffic)
+```
+
+**Benefits**:
+- Don't waste CF computation on users with insufficient data
+- Content-based provides better recommendations for sparse users than weak CF embeddings
+- Clear separation of concerns for monitoring and A/B testing
+- **Traffic optimization**: ~91.4% traffic uses fast content-based path; only ~8.6% uses CF
 
 ## Architecture Overview
 
@@ -374,17 +409,104 @@ def batch_recommend(self, user_ids, topk=10, exclude_seen=True):
     return results
 ```
 
-## Component 3: Cold-Start Fallback
+## Component 3: Cold-Start Fallback (UPDATED)
 
 ### Module: `service/recommender/fallback.py`
 
-#### Function: `_fallback_recommendations(topk, filter_params=None)`
+#### Strategy Overview
+For users with 1-2 interactions (cold-start), skip CF and use **Item-Item Similarity + Popularity**.
 
-##### Strategy 1: Popularity-Based
+#### Function 1: `_fallback_item_similarity(user_history, topk, filter_params=None)`
+
+##### Purpose: Content-Based Recommendations
 ```python
-def _fallback_recommendations(self, topk=10, filter_params=None):
+def _fallback_item_similarity(self, user_history, topk=10, filter_params=None):
     """
-    Fallback tới popularity ranking cho cold-start users.
+    Fallback strategy: Find similar items to user's purchase history using PhoBERT.
+    
+    Args:
+        user_history: List of product_ids user has interacted with
+        topk: Number of recommendations
+        filter_params: Optional attribute filters
+    
+    Returns:
+        list of dict: Content-similar products ranked by relevance
+    """
+    if not user_history:
+        # Truly new user → pure popularity
+        return self._fallback_popularity(topk, filter_params)
+    
+    # Load PhoBERT embeddings
+    if not hasattr(self, '_phobert_loader'):
+        from service.recommender.phobert_loader import PhoBERTEmbeddingLoader
+        self._phobert_loader = PhoBERTEmbeddingLoader()
+    
+    # Get embeddings for user history
+    history_embeddings = []
+    for pid in user_history:
+        emb = self._phobert_loader.get_embedding(pid)
+        if emb is not None:
+            history_embeddings.append(emb)
+    
+    if not history_embeddings:
+        return self._fallback_popularity(topk, filter_params)
+    
+    # Compute user profile (mean of history embeddings)
+    user_profile = np.mean(history_embeddings, axis=0)
+    
+    # Compute similarity to all items
+    all_item_ids = self.item_metadata['product_id'].tolist()
+    similarities = {}
+    
+    for pid in all_item_ids:
+        if pid in user_history:
+            continue  # Skip already purchased
+        
+        item_emb = self._phobert_loader.get_embedding(pid)
+        if item_emb is not None:
+            sim = cosine_similarity(user_profile, item_emb)
+            similarities[pid] = sim
+    
+    # Apply filters
+    if filter_params:
+        filtered_metadata = self.item_metadata.copy()
+        for key, value in filter_params.items():
+            if key in filtered_metadata.columns:
+                filtered_metadata = filtered_metadata[filtered_metadata[key] == value]
+        valid_pids = set(filtered_metadata['product_id'].tolist())
+        similarities = {pid: sim for pid, sim in similarities.items() if pid in valid_pids}
+    
+    # Rank by similarity
+    top_similar = sorted(similarities.items(), key=lambda x: x[1], reverse=True)[:topk]
+    
+    # Format output
+    recommendations = []
+    for rank, (pid, sim_score) in enumerate(top_similar, 1):
+        product_info = self.item_metadata[self.item_metadata['product_id'] == pid].iloc[0]
+        recommendations.append({
+            'product_id': pid,
+            'score': float(sim_score),
+            'rank': rank,
+            'fallback': True,
+            'fallback_method': 'item_similarity',
+            **product_info.to_dict()
+        })
+    
+    return recommendations
+
+
+def cosine_similarity(vec1, vec2):
+    """Compute cosine similarity between two vectors."""
+    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+```
+
+#### Function 2: `_fallback_popularity(topk, filter_params=None)`
+
+##### Purpose: Pure Popularity for Truly New Users
+```python
+def _fallback_popularity(self, topk=10, filter_params=None):
+    """
+    Fallback tới popularity ranking cho truly new users (no history).
     
     Args:
         topk: Number of recommendations
@@ -393,14 +515,18 @@ def _fallback_recommendations(self, topk=10, filter_params=None):
     Returns:
         list of dict: Popular products
     """
-    # Sort by num_sold_time (popularity signal)
-    popular = self.item_metadata.sort_values('num_sold_time', ascending=False)
+    # Sort by popularity_score (log-transformed from Task 01)
+    popular = self.item_metadata.sort_values('popularity_score', ascending=False)
     
     # Apply filters nếu có
     if filter_params:
         for key, value in filter_params.items():
             if key in popular.columns:
-                popular = popular[popular[key] == value]
+                # Handle standardized lists (e.g., skin_type_standardized)
+                if isinstance(value, list):
+                    popular = popular[popular[key].apply(lambda x: any(v in x for v in value))]
+                else:
+                    popular = popular[popular[key] == value]
     
     # Top-K
     top_popular = popular.head(topk)
@@ -410,47 +536,71 @@ def _fallback_recommendations(self, topk=10, filter_params=None):
     for i, row in top_popular.iterrows():
         recommendations.append({
             'product_id': row['product_id'],
-            'score': row['num_sold_time'],  # Popularity score
+            'score': row['popularity_score'],  # Log-transformed popularity
             'rank': len(recommendations) + 1,
-            'fallback': True,  # Flag fallback
+            'fallback': True,
+            'fallback_method': 'popularity',
             **row.to_dict()
         })
     
     return recommendations
 ```
 
-##### Strategy 2: Hybrid với PhoBERT (Advanced)
+#### Function 3: `_hybrid_fallback(user_history, topk, content_weight=0.7, popularity_weight=0.3)`
+
+##### Purpose: Mix Content Similarity + Popularity
 ```python
-def _fallback_phobert(self, user_query, topk=10):
+def _hybrid_fallback(self, user_history, topk=10, content_weight=0.7, popularity_weight=0.3):
     """
-    Fallback tới PhoBERT semantic search nếu có user query.
+    Hybrid fallback: Combine item similarity with popularity.
     
     Args:
-        user_query: Vietnamese text query
+        user_history: User's purchase history
         topk: Number of recommendations
+        content_weight: Weight for content similarity (default 0.7)
+        popularity_weight: Weight for popularity (default 0.3)
     
     Returns:
-        list of dict: Semantically similar products
+        list of dict: Hybrid recommendations
     """
-    from model.phobert_recommendation import PhoBERTRecommender
+    # Get content-based candidates (2x topk for diversity)
+    content_recs = self._fallback_item_similarity(user_history, topk=topk*2)
     
-    # Initialize PhoBERT (cache instance)
-    if not hasattr(self, '_phobert'):
-        self._phobert = PhoBERTRecommender(...)
+    # Create score dict
+    scores = {}
+    for rec in content_recs:
+        pid = rec['product_id']
+        # Normalize content score to [0,1]
+        content_score = rec['score']
+        
+        # Get popularity score (already normalized in enriched metadata)
+        product_info = self.item_metadata[self.item_metadata['product_id'] == pid].iloc[0]
+        pop_score = product_info['popularity_score']
+        
+        # Weighted combination
+        final_score = content_weight * content_score + popularity_weight * pop_score
+        scores[pid] = {
+            'final_score': final_score,
+            'content_score': content_score,
+            'popularity_score': pop_score,
+            'product_info': product_info
+        }
     
-    # Search by query
-    results = self._phobert.get_recommendations_by_name(user_query, topk)
+    # Rank by final score
+    top_items = sorted(scores.items(), key=lambda x: x[1]['final_score'], reverse=True)[:topk]
     
-    # Format
+    # Format output
     recommendations = []
-    for r in results:
+    for rank, (pid, data) in enumerate(top_items, 1):
         recommendations.append({
-            'product_id': r['product_id'],
-            'score': r['similarity_score'],
-            'rank': len(recommendations) + 1,
+            'product_id': pid,
+            'score': data['final_score'],
+            'rank': rank,
             'fallback': True,
-            'fallback_method': 'phobert',
-            **r
+            'fallback_method': 'hybrid',
+            'content_score': data['content_score'],
+            'popularity_score': data['popularity_score'],
+            **data['product_info'].to_dict()
         })
     
     return recommendations
