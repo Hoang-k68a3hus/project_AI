@@ -1,225 +1,173 @@
-# Kiến Trúc Hệ Thống Gợi Ý (ALS + BPR)
+# Kiến Trúc Hệ Thống Gợi Ý (ALS + BPR + PhoBERT)
 
 ## Tổng Quan
 
-Hệ thống gợi ý hybrid kết hợp Collaborative Filtering (ALS, BPR) với khả năng mở rộng rerank bằng PhoBERT embeddings và thuộc tính sản phẩm. Kiến trúc được thiết kế theo nguyên tắc modular, hỗ trợ versioning, monitoring và tự động hóa.
+Hệ thống gợi ý hybrid hiện đại hóa kết hợp **Collaborative Filtering (ALS, BPR)** với **Content-Based Filtering (PhoBERT)** và **Sentiment Analysis**. Kiến trúc được tối ưu cho dữ liệu thưa (sparsity ~99.9%) và rating skew (95% 5-star) thông qua chiến lược phân khúc người dùng (User Segmentation) và làm giàu tín hiệu (Signal Enrichment).
 
 ## Sơ Đồ Luồng Dữ Liệu
 
 ```
 Raw Data (CSV)
     ↓
-Data Processing Layer (tiền xử lý, normalization)
+Data Processing Layer
+    ├─ Sentiment Analysis (Rating + Comment Quality)
+    ├─ User Segmentation (Trainable vs Cold-Start)
+    └─ BERT Embedding Generation
     ↓
-Training Pipelines (ALS / BPR)
+Training Pipelines
+    ├─ ALS (Confidence-Weighted)
+    └─ BPR (Hard Negative Mining)
     ↓
-Model Registry (versioning, tracking)
+Model Registry (Versioning: Models + Embeddings)
     ↓
-Serving Layer (API, rerank, fallback)
+Serving Layer (FastAPI)
+    ├─ Routing: Trainable → CF | Cold-Start → Content-Based
+    └─ Reranking: Hybrid Scores
     ↓
 Monitoring & Logging
-    ↓
-Scheduler (retrain, update)
 ```
 
 ## Các Tầng Chính
 
-- **Nguồn dữ liệu raw**: CSV files trong `data/published_data/`
-- **Preprocessing pipeline**: Chuẩn hóa, deduplicate, filter
-- **Storage**: Parquet files cho hiệu năng, JSON cho mappings, PhoBERT embeddings (`data/processed/content_based_embeddings/product_embeddings.pt`)
-- **Versioning**: Hash và timestamp theo dõi phiên bản dữ liệu và embedding metadata
+### 1. Tầng Dữ Liệu (Data Layer) - Task 01
+- **Sentiment-Enhanced Confidence**: `confidence_score` = Rating (1-5) + Comment Quality (0-1). Giúp phân biệt "bare 5-star" và "genuine 5-star".
+- **User Segmentation**:
+  - **Trainable Users** (≥2 interactions): Dùng cho CF training (~8.6% users).
+  - **Cold-Start Users** (<2 interactions): Dùng Content-Based (~91.4% users).
+- **Hard Negative Mining**: Kết hợp Explicit (Rating ≤3) và Implicit (Popular items not bought).
+- **Artifacts**: Parquet files, CSR matrices, User/Item Mappings, Global Stats (cho normalization).
 
-### 2. Tầng Huấn Luyện (Training Layer)
-- **Shared preprocessing**: Module `recsys/cf/data.py`
-- **ALS pipeline**: Implicit matrix factorization (có hỗ trợ khởi tạo từ PhoBERT)
-- **BPR pipeline**: Bayesian personalized ranking (tùy chọn fine-tune với content loss)
-- **PhoBERT projection**: Giảm chiều 768→latent (TruncatedSVD) trong `recsys/bert`
-- **Hyperparameter tuning**: Grid search với tracking
-- **Artifacts management**: Lưu trữ có tổ chức theo model type và biến thể content-aware
+### 2. Tầng Huấn Luyện (Training Layer) - Task 02
+- **ALS Pipeline**: Matrix Factorization trên `confidence_score`.
+  - **BERT Initialization**: Khởi tạo item factors từ PhoBERT embeddings để hỗ trợ sparse items.
+  - **Regularization**: Tăng cường cho users ít tương tác.
+- **BPR Pipeline**: Pairwise Ranking với chiến lược sampling 30% Hard Negatives (Explicit + Implicit).
+- **Artifacts**: User/Item Factors (U, V), Metadata (Score Ranges cho normalization).
 
-### 3. Tầng Đánh Giá (Evaluation Layer)
-- **Metrics**: Recall@K, NDCG@K, diversity (BERT cosine), semantic alignment, cold-start coverage
-- **Baseline comparison**: Popularity-based ranking và CF thuần
-- **Validation strategy**: Leave-one-out temporal split, cold-start holdout
-- **Reporting**: CSV summaries, visualization, hybrid vs CF comparison dashboards
+### 3. Tầng Đánh Giá (Evaluation Layer) - Task 03
+- **Core Metrics**: Recall@K, NDCG@K (Test set chỉ chứa positive interactions rating ≥4).
+- **Hybrid Metrics**:
+  - **Diversity**: Dựa trên cosine similarity của PhoBERT embeddings.
+  - **Semantic Alignment**: Độ tương đồng giữa CF recommendations và user profile.
+  - **Cold-Start Coverage**: Khả năng recommend items ít phổ biến.
+- **Validation**: Leave-one-out temporal split.
 
-### 4. Tầng Registry (Model Registry)
-- **Best model tracking**: Theo NDCG@10 và hybrid metrics
-- **Version control**: Hash, timestamp, hyperparameters, embedding version
-- **Rollback support**: Giữ lịch sử các phiên bản
-- **Metadata**: Performance metrics, data provenance, compatibility checks CF ↔ PhoBERT
+### 4. Tầng Registry (Model Registry) - Task 04
+- **Dual Registry**: Quản lý version của cả **CF Models** và **BERT Embeddings**.
+- **Metadata**: Tracking data hash, git commit, hyperparameters, và score distribution (min/max/p99) để phục vụ normalization tại serving.
+- **Selection**: Tự động chọn best model dựa trên NDCG@10.
 
-### 5. Tầng Dịch Vụ (Serving Layer)
-- **Model loader**: Nạp model và mappings
-- **Core recommender**: Top-K generation với filtering
-- **PhoBERTEmbeddingLoader**: LRU cache, user profile aggregation
-- **Fallback logic**: Popularity và content-based cho cold-start users
-- **Reranking**: Hybrid scoring với PhoBERT/attributes
-- **API endpoint**: REST API cho integration
+### 5. Tầng Dịch Vụ (Serving Layer) - Task 05
+- **Smart Routing**:
+  - **Trainable Users**: Gọi CF Model (ALS/BPR) → Rerank.
+  - **Cold-Start Users**: Gọi Fallback (PhoBERT Item-Item Similarity + Popularity).
+- **Hybrid Reranking**: Kết hợp điểm số:
+  `Score = w1*CF + w2*Content + w3*Popularity + w4*Quality`
+- **Optimization**: Caching user history, pre-computed similarity matrices.
 
-### 6. Tầng Giám Sát (Monitoring Layer)
-- **Training logs**: Theo dõi quá trình huấn luyện
-- **Service logs**: Request, latency, errors
-- **Drift detection**: So sánh phân phối dữ liệu và semantic drift embedding
-- **Embedding freshness**: Kiểm tra tuổi đời PhoBERT embeddings, alert khi quá hạn
-- **Alert system**: Trigger retrain/refetch khi cần
+### 6. Tầng Giám Sát (Monitoring Layer) - Task 06
+- **Data Drift**: Theo dõi phân phối rating và sentiment.
+- **Embedding Drift**: Kiểm tra semantic shift của sản phẩm mới.
+- **Operational Metrics**: Latency, Fallback Rate, Error Rate.
 
-### 7. Tầng Tự Động Hóa (Automation Layer)
-- **Training scripts**: Chạy pipelines theo config
-- **Registry updater**: Cập nhật best model
-- **BERT refresh**: `scripts/refresh_bert_embeddings.py` chạy hằng tuần (cron/Airflow)
-- **Scheduler**: Cron/Airflow jobs (data refresh, drift detection, embeddings, training)
-- **CI/CD**: Testing và deployment
+### 7. Tầng Tự Động Hóa (Automation Layer) - Task 07
+- **Scheduler**: Airflow/Cron cho định kỳ Retrain và Data Refresh.
+- **CI/CD**: Automated testing cho data validation và model performance.
 
 ## Cấu Trúc Thư Mục
 
 ```
 project/
 ├── data/
-│   ├── published_data/              # Raw CSV files
-│   ├── processed/                   # Parquet, mappings, CF matrices
-│   ├── processed_test/              # Evaluation subsets
-│   └── content_based_embeddings/    # PhoBERT artifacts (product_embeddings.pt, metadata)
-├── tasks/                           # Task documentation
-├── model/
-│   └── phobert_recommendation.py    # Legacy PhoBERT prototype
+│   ├── published_data/              # Raw CSVs
+│   ├── processed/                   # Parquet, CSR, Mappings
+│   │   ├── interactions.parquet
+│   │   ├── user_metadata.pkl        # Segmentation info
+│   │   └── data_stats.json          # Global stats
+│   └── content_based_embeddings/    # PhoBERT artifacts
+├── tasks/                           # Documentation
 ├── recsys/
-│   └── cf/
-│       ├── data.py                  # Shared preprocessing
-│       ├── metrics.py               # Evaluation metrics
-│       ├── als.py                   # ALS implementation
-│       └── bpr.py                   # BPR implementation
+│   ├── cf/
+│   │   ├── data.py                  # Data processing & Segmentation
+│   │   ├── als.py                   # ALS with BERT Init
+│   │   ├── bpr.py                   # BPR with Hard Negatives
+│   │   └── metrics.py               # Hybrid Metrics
+│   └── bert/                        # Embedding generation
 ├── artifacts/
 │   └── cf/
-│       ├── als/                     # ALS models, metrics
-│       ├── bpr/                     # BPR models, metrics
-│       └── registry.json            # Best model pointer
+│       ├── registry.json            # Model & Embedding Registry
+│   │   └── ...
 ├── service/
 │   ├── recommender/
-│   │   ├── loader.py                # Model loading
-│   │   ├── recommender.py           # Core recommendation logic
-│   │   ├── rerank.py                # Hybrid reranking
-│   │   └── api.py                   # REST API
-│   └── config/
-│       └── serving_config.yaml      # Serving configurations
-├── scripts/
-│   ├── train_cf.py                  # Training orchestration
-│   ├── update_registry.py           # Registry management
-│   └── evaluate_models.py           # Batch evaluation
-├── logs/
-│   ├── cf/                          # Training logs
-│   └── service/                     # Service logs
-└── reports/
-    ├── cf_eval_summary.csv          # Performance summaries
-    └── drift_analysis/              # Data drift reports
+│   │   ├── loader.py                # Model & Mapping Loader
+│   │   ├── recommender.py           # Core Logic
+│   │   ├── fallback.py              # Cold-Start Strategies
+│   │   └── rerank.py                # Hybrid Scoring
+│   └── api.py                       # FastAPI
+└── scripts/                         # Automation Scripts
 ```
 
 ## Workflow Chính
 
-### Workflow 1: Training & Evaluation
-1. Load raw CSV → preprocessing → save parquet
-2. Build CSR matrix, user-item mappings
-3. Generate PhoBERT embeddings & project vào latent space (nếu cần)
-4. Train ALS và BPR pipelines (parallel hoặc sequential, optional BERT init)
-5. Evaluate với metrics chuẩn + hybrid metrics
-6. So sánh với baseline popularity và CF thuần
-7. Update registry nếu performance tốt hơn (ghi nhận embedding version)
-8. Save artifacts với versioning
+### Workflow 1: Data Pipeline & Training
+1. **Ingest**: Load raw CSV, validate timestamps & ratings.
+2. **Enrich**: Tính `confidence_score` (Rating + Comment Quality).
+3. **Segment**: Gán cờ `is_trainable` (≥2 interactions).
+4. **Embed**: Generate/Update PhoBERT embeddings cho products.
+5. **Train**:
+   - Run ALS (Confidence-weighted, BERT-init).
+   - Run BPR (Hard Negative Sampling).
+6. **Evaluate**: So sánh NDCG@10 trên tập test (Trainable users only).
+7. **Register**: Lưu model tốt nhất kèm metadata (Score ranges).
 
 ### Workflow 2: Serving Recommendations
-1. Load best model từ registry
-2. Nhận request với `user_id`, `topk`, `exclude_seen`
-3. Map user_id → u_idx
-4. Load PhoBERT embeddings (theo version registry) → compute user profile
-5. Generate scores = U[u] · V^T
-6. Mask seen items (nếu exclude_seen=True)
-7. Apply reranking (CF + PhoBERT + signals)
-8. Return top-K product_ids
-9. Log request, latency, embedding version
+1. **Request**: Nhận `user_id`.
+2. **Check Segment**: User thuộc nhóm Trainable hay Cold-Start?
+3. **Branch A (Trainable)**:
+   - Retrieve CF Candidates (ALS/BPR).
+   - Filter seen items.
+   - **Rerank**: Combine CF score với Content Similarity & Popularity.
+4. **Branch B (Cold-Start)**:
+   - **Item-Item Similarity**: Tìm items giống lịch sử mua (dùng PhoBERT).
+   - **Popularity Fallback**: Nếu lịch sử trống, dùng Top items (theo `num_sold_time`).
+5. **Response**: Trả về Top-K items kèm giải thích (e.g., "Similar to X", "Popular").
 
-### Workflow 3: Cold-Start Handling
-1. Check user_id trong mappings
-2. Nếu không tồn tại → fallback popularity
-3. Popularity source: `num_sold_time` hoặc train frequency
-4. PhoBERT content-based recommendations dựa trên browsing/session
-5. Filter theo thuộc tính nếu có (brand, skin_type)
-6. Return top-K popular/content items
-
-### Workflow 4: Hybrid Reranking
-1. Get CF scores từ ALS/BPR
-2. PhoBERTEmbeddingLoader tạo user profile (weighted_mean, tf_idf)
-3. Compute content similarity với top-K items
-4. Load popularity signals (num_sold_time, avg_star) và attribute match
-5. Combine scores: α*CF + β*content + γ*popularity + δ*quality ± diversity penalty
-6. Re-sort và return final top-K, log signals
-
-### Workflow 5: Monitoring & Retraining
-1. Scheduler chạy định kỳ (daily/weekly)
-2. Load new interactions → preprocess
-3. Detect data drift (distribution shift) và semantic drift (embeddings)
-4. Check embedding freshness → trigger `refresh_bert_embeddings.py` nếu quá hạn
-5. Trigger retrain nếu drift > threshold hoặc embeddings mới
-6. Run evaluation pipeline (CF vs hybrid)
-7. Update registry nếu model mới tốt hơn, ghi nhận embedding version
-8. Send alert/report
+### Workflow 3: Hybrid Reranking Detail
+1. **Normalize**: Chuẩn hóa các điểm số (CF, Popularity, Quality) về [0,1] dùng global stats từ Registry.
+2. **Compute Content Score**: Cosine similarity giữa User Profile (PhoBERT) và Candidate Item.
+3. **Weighted Sum**: Áp dụng công thức tổng hợp.
+4. **Diversity Penalty** (Optional): Trừ điểm nếu items quá giống nhau.
 
 ## Nguyên Tắc Thiết Kế
 
-### Modularity
-- Mỗi component độc lập, có interface rõ ràng
-- Shared preprocessing giữa ALS và BPR
-- Reusable metrics module
+### Quality over Quantity
+- Chỉ train CF trên users có đủ dữ liệu (≥2 interactions).
+- Dùng Content-based để lấp đầy khoảng trống cho cold-start users.
 
-### Versioning
-- Mọi artifact có version identifier
-- Track data hash/timestamp
-- Keep history cho rollback
+### Semantic-Aware
+- Tận dụng PhoBERT để hiểu ngữ nghĩa sản phẩm (Thành phần, Công dụng) thay vì chỉ dựa vào ID.
+- Sentiment analysis giúp hiểu sâu hơn về rating.
 
-### Monitoring
-- Log mọi training run và serving request
-- Track metrics theo thời gian
-- Alert khi performance degradation
-
-### Scalability
-- Parquet cho large datasets
-- CSR matrix cho sparse data
-- Optional GPU support cho ALS
-
-### Reproducibility
-- Save random seeds
-- Version control cho code và config
-- Document data provenance
+### Reproducibility & Safety
+- Versioning chặt chẽ từ Data → Embeddings → Model.
+- Fallback mechanisms đảm bảo luôn có recommendations.
 
 ## Integration Points
 
 ### 1. PhoBERT System
-- Reuse embeddings từ `content_based_embeddings/`
-- Hybrid reranking kết hợp CF + semantic similarity
-- Fallback cho cold-start items
+- Cung cấp embeddings cho: BERT Initialization (Training), Content-Based Fallback (Serving), và Semantic Metrics (Evaluation).
 
-### 2. Attribute Filtering
-- Load từ `data_product_attribute.csv`
-- Pre-filter theo brand, skin_type, ingredient
-- Enhance diversity trong recommendations
+### 2. Attribute System
+- Dữ liệu thuộc tính (`data_product_attribute.csv`) dùng cho Hard Filtering và làm giàu text cho BERT.
 
-### 3. Popularity Signals
-- `num_sold_time` từ `data_product.csv`
-- `avg_star` cho quality signal
-- Boost popular items cho exploration
-
-### 4. API Layer
-- REST endpoints cho web/mobile integration
-- Batch recommendation API
-- Real-time single-user API
+### 3. Feedback Loop
+- Logs từ Serving được đưa lại vào Data Pipeline để retrain và detect drift.
 
 ## Next Steps
 
-Xem các file tasks chi tiết:
-- `01_data_layer.md` - Tầng dữ liệu và preprocessing
-- `02_training_pipelines.md` - ALS và BPR training
-- `03_evaluation_metrics.md` - Đánh giá và benchmarking
-- `04_model_registry.md` - Quản lý phiên bản model
-- `05_serving_layer.md` - Dịch vụ gợi ý
-- `06_monitoring_logging.md` - Giám sát và logging
-- `07_automation_scheduling.md` - Tự động hóa và scheduling
-- `08_hybrid_reranking.md` - Rerank và hybrid strategies
+Xem chi tiết implementation tại:
+- `01_data_layer.md`: Xử lý dữ liệu, Sentiment, Segmentation.
+- `02_training_pipelines.md`: ALS/BPR implementation details.
+- `03_evaluation_metrics.md`: Hybrid metrics & Testing.
+- `04_model_registry.md`: Quản lý version.
+- `05_serving_layer.md`: Logic routing và fallback.

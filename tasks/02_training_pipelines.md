@@ -62,20 +62,33 @@ Preprocessed Data (từ Task 01)
 
 ## Shared Components
 
-### 1. Data Loading (Reuse từ Task 01)
-- **Module**: `recsys/cf/data.py`
-- **Functions**:
-  - `load_processed_data(version)` → dict với matrices, mappings, splits
+### 1. Data Loading (Updated: DataProcessor Orchestration)
+- **Module**: `recsys/cf/data/data.py`
+- **Class**: `DataProcessor`
+- **Usage**:
+  ```python
+  from recsys.cf.data import DataProcessor
+  
+  processor = DataProcessor(base_path="data/published_data")
+  
+  # 1. Load & Validate
+  df_clean, stats = processor.load_and_validate_interactions()
+  
+  # 2. Prepare ALS Matrix
+  X_train_conf, als_stats = processor.prepare_als_matrix(
+      df_clean, num_users, num_items
+  )
+  
+  # 3. Prepare BPR Data
+  df_bpr, hard_neg_sets = processor.prepare_bpr_labels(df_clean)
+  user_pos_sets = processor.build_bpr_positive_sets(df_bpr)
+  ```
 - **Outputs**:
-  - `X_train_confidence`: CSR matrix với confidence scores (1-6) for ALS - **trainable users only**
-  - `X_train_binary`: CSR matrix với binary values (optional) for BPR - **trainable users only**
-  - `user_pos_train`: Dict[u_idx, Set[i_idx]] - positive interactions (trainable users)
-  - `user_hard_neg_train`: Dict[u_idx, Dict["explicit"|"implicit", Set[i_idx]]] - dual hard negatives
-  - `test_interactions`: DataFrame với held-out positives from **trainable users only**
-  - `user_metadata`: Segmentation data (trainable vs cold-start users)
-  - `mappings`: User/item ID mappings
-  - `top_k_popular_items`: Top-50 popular item indices for implicit negatives
-  - `item_popularity`: Log-transformed popularity array
+  - `X_train_confidence`: CSR matrix (ALS) - from `prepare_als_matrix`
+  - `df_bpr`: DataFrame with `is_positive`, `is_hard_negative` columns (BPR)
+  - `user_pos_sets`: Dict[u, Set[i]] (BPR sampling)
+  - `hard_neg_sets`: Dict[u, Set[i]] (BPR sampling)
+  - `mappings`: ID mappings from `processor.id_mapper`
 
 ### 2. Configuration Management
 - **File**: `config/training_config.yaml`
@@ -118,25 +131,20 @@ Preprocessed Data (từ Task 01)
 ### Step 1: Matrix Preparation (UPDATED: Sentiment-Enhanced Confidence)
 
 #### 1.1 Load Confidence Matrix
-- **Input**: `X_train_confidence.npz` từ Task 01
-- **Shape**: (num_trainable_users, num_items)
-- **Values**: Confidence scores (1.0-6.0) = rating + comment_quality
-  - Range breakdown:
-    - [1.0-2.0]: Low ratings with/without quality comments
-    - [3.0-4.0]: Medium ratings with variable comment quality
-    - [5.0-6.0]: High ratings, 6.0 indicates genuine enthusiasm (detailed review)
-- **Rationale**: Combat 95% 5-star skew by incorporating review sentiment
-- **Coverage**: Only trainable users (≥3 interactions) - better model quality
+- **Method**: `DataProcessor.prepare_als_matrix`
+- **Underlying Class**: `ALSDataPreparer` (`recsys/cf/data/processing/als_data.py`)
+- **Input**: DataFrame with `confidence_score` (computed in Step 2.0)
+- **Logic**:
+  - `confidence_score = rating + comment_quality` (Range: 1.0 - 6.0)
+  - **Normalization** (Optional): `(conf - 1) / 5` → [0, 1]
+- **Output**: `csr_matrix` of shape (num_users, num_items)
 
 #### 1.2 Confidence Scaling Strategy
-- **Option 1 (Direct)**: Use confidence scores directly
-  - `C[u,i] = confidence_score` if observed
-  - `C[u,i] = 1` for unobserved (low confidence baseline)
-  
-- **Option 2 (Scaled - Recommended)**: Apply moderate alpha scaling
-  - `C = 1 + alpha * (confidence - 1) / 5` (normalize to [0,1] first)
-  - Default alpha: **5-10** (much lower than binary case 40 due to richer signal)
-  - Higher confidence values already encode quality
+- **Implementation**: Handled within `ALSDataPreparer` or during training
+- **Range**: 
+  - Raw: [1.0, 6.0] (Default)
+  - Normalized: [0.0, 1.0]
+- **Recommendation**: Use **Raw** scores with lower alpha (5-10) or **Normalized** with standard alpha (20-40).
 
 #### 1.3 Preference Matrix (Optional)
 - **P**: Can derive binary preference from confidence
@@ -308,53 +316,35 @@ model = AlternatingLeastSquares(
 ### Step 1: Data Preparation
 
 #### 1.1 Load Positive Sets
-- **Input**: `user_pos_train.pkl` (Dict[u_idx, Set[i_idx]])
-- **Purpose**: Fast lookup cho negative sampling
+- **Method**: `DataProcessor.build_bpr_positive_sets`
+- **Input**: DataFrame with `is_positive=1` (Rating ≥ 4.0)
+- **Output**: `Dict[u_idx, Set[i_idx]]`
 
 #### 1.2 Positive Pairs List
-- **Format**: List of tuples `(u_idx, i_idx)` for all train positives
-- **Size**: ~369K pairs (after filtering)
+- **Format**: Derived from `user_pos_sets` or DataFrame
+- **Definition**: `(u, i)` where `rating >= 4.0`
 
-### Step 2: Dual Hard Negative Mining Strategy (UPDATED)
+### Step 2: Dual Hard Negative Mining Strategy (Implemented)
 
-#### 2.1 Hard Negative Sampling - Explicit + Implicit (PRIMARY)
-- **Load hard negatives**: `user_hard_neg_train` with structure:
-  ```python
-  {
-    u_idx: {
-      "explicit": set([i_idx1, i_idx2]),  # Items with rating ≤3
-      "implicit": set([i_idx3, i_idx4])   # Popular items user didn't buy
-    }
-  }
-  ```
-
-- **Sampling Strategy**:
-  - For each (u, i+), sample j- from mix:
-    - 15% from `explicit` hard negatives (if available)
-    - 15% from `implicit` hard negatives (popular items not bought)
-    - 70% uniform random from unseen items
-  - Reject if j- in `user_pos_train[u]` → resample
-
-- **Rationale**: 
-  - **Explicit negatives**: "You bought this but hated it" - strong signal
-  - **Implicit negatives**: "Everyone bought this but you didn't" - preference signal
-  - **Random negatives**: Maintain diversity, avoid over-focusing on hard cases
+#### 2.1 Hard Negative Sampling - Explicit + Implicit
+- **Method**: `DataProcessor.prepare_bpr_labels` -> `BPRDataPreparer.mine_hard_negatives`
+- **Output**: `hard_neg_sets` (Dict[u, Set[i]])
+- **Composition**:
+  - **Explicit**: Items with `rating <= 3.0` (User disliked)
+  - **Implicit**: Top-50 popular items user DID NOT interact with
+- **Sampling Logic** (in Training Loop):
+  - `30%` from `hard_neg_sets` (Mixed Explicit/Implicit)
+  - `70%` Uniform Random from unseen items
 
 #### 2.2 Implicit Negative Generation Details
-- **Source**: `top_k_popular_items` (Top-50 from Task 01)
-- **Logic**: For each trainable user, find popular items NOT in their history
-  ```python
-  implicit_negs = set(top_k_popular_items) - user_pos_train[u] - user_hard_neg_train[u]["explicit"]
-  ```
-- **Why effective for sparse data**: 
-  - Popular items have high probability of being relevant
-  - User NOT buying them signals negative preference
-  - More informative than random unpopular items
+- **Source**: `BPRDataPreparer._find_implicit_negatives`
+- **Logic**: `Top-50 Popular - User Interactions`
+- **Why**: "Everyone bought this, but you didn't" = Strong negative signal
 
 #### 2.3 Fallback Strategy
 - **For users without hard negatives**: 
-  - Use 30% popularity-biased sampling + 70% uniform random
-  - Popularity-biased: Sample from log-transformed `item_popularity` distribution
+  - Fallback to 100% random sampling or popularity-biased sampling
+  - `BPRDataPreparer` handles this by returning empty sets for those users
 
 #### 2.4 Samples Per Epoch
 - **Rule**: `samples_per_epoch = num_positives * multiplier`
