@@ -1,0 +1,140 @@
+# CF Recommendation Service Configuration
+# ========================================
+
+# Model Configuration
+model:
+  registry_path: "artifacts/cf/registry.json"
+  default_model_type: "bert_als"  # bert_als, als, bpr
+  auto_reload: true
+  reload_check_interval_seconds: 300  # Check every 5 minutes
+
+# Serving Configuration  
+serving:
+  host: "0.0.0.0"
+  port: 8000
+  workers: 4
+  timeout_seconds: 30
+  max_batch_size: 100
+  
+# Default recommendation parameters
+recommendation:
+  default_topk: 10
+  max_topk: 100
+  exclude_seen: true
+  
+# User segmentation thresholds
+user_segmentation:
+  trainable_threshold: 2  # Min interactions to be trainable
+  positive_rating_threshold: 4.0
+
+# Fallback Configuration (for cold-start users)
+fallback:
+  # Strategy: popularity, item_similarity, hybrid
+  default_strategy: "hybrid"
+  
+  # Popularity fallback
+  popularity:
+    top_k_items: 50
+    boost_new_items: true
+    new_item_days: 30
+    
+  # Item similarity (content-based)
+  item_similarity:
+    use_phobert: true
+    embedding_dim: 768  # or 1024
+    precompute_similarity: true
+    similarity_topk: 100
+    
+  # Hybrid weights for cold-start
+  hybrid_weights:
+    content: 0.6
+    popularity: 0.3
+    quality: 0.1
+
+# Reranking Configuration (for trainable users)
+reranking:
+  enabled: true
+  
+  # Default weights for hybrid reranking
+  weights:
+    cf: 0.3           # CF score
+    content: 0.4      # PhoBERT content similarity
+    popularity: 0.2   # Popularity score
+    quality: 0.1      # Rating/review quality
+    
+  # Diversification
+  diversify: true
+  diversity_category_weight: 0.5
+  diversity_window: 3  # Every N items, penalize same category
+
+# Filtering Configuration
+filtering:
+  enabled: true
+  available_filters:
+    - brand
+    - skin_type
+    - price_range
+    - category
+  
+# Caching Configuration
+caching:
+  # User history cache
+  user_history:
+    enabled: true
+    preload: true  # Load at startup
+    
+  # Popular items cache
+  popular_items:
+    enabled: true
+    top_k: 50
+    refresh_interval_seconds: 3600  # 1 hour
+    
+  # Item similarity cache (for content-based)
+  item_similarity:
+    enabled: true
+    precompute_at_startup: false  # Heavy operation
+    max_cache_items: 1000
+
+# API Configuration
+api:
+  cors_origins: ["*"]
+  rate_limit: 1000  # Requests per minute
+  enable_docs: true  # Swagger docs at /docs
+  
+# Logging Configuration
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  log_requests: true
+  log_latency: true
+  
+  # Log files
+  files:
+    api_log: "logs/service/api.log"
+    error_log: "logs/service/error.log"
+    
+# Monitoring Configuration
+monitoring:
+  enabled: true
+  metrics_endpoint: "/metrics"
+  health_endpoint: "/health"
+  
+  # Metrics to collect
+  metrics:
+    - request_count
+    - request_latency
+    - cf_vs_fallback_ratio
+    - recommendation_count
+    - error_rate
+
+# Paths (relative to project root)
+paths:
+  data_dir: "data/processed"
+  artifacts_dir: "artifacts/cf"
+  logs_dir: "logs/service"
+  
+  # Specific files
+  user_mappings: "data/processed/user_item_mappings.json"
+  trainable_user_mapping: "data/processed/trainable_user_mapping.json"
+  item_metadata: "data/processed/item_metadata.pkl"
+  phobert_embeddings: "data/processed/content_based_embeddings/product_embeddings.pt"

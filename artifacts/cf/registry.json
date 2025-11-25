@@ -1,0 +1,184 @@
+{
+  "current_best": {
+    "model_id": "bert_als_20251125_061805",
+    "model_type": "bert_als",
+    "version": "20251125_061805",
+    "path": "artifacts/cf/bert_als/20251125_061805",
+    "selection_metric": "recall@10",
+    "selection_value": 0.128,
+    "selected_at": "2025-11-25T17:30:00",
+    "selected_by": "auto"
+  },
+  "models": {
+    "bert_als_20251125_061805": {
+      "model_type": "bert_als",
+      "version": "20251125_061805",
+      "path": "artifacts/cf/bert_als/20251125_061805",
+      "created_at": "2025-11-25T06:18:05",
+      "data_version": "20251124_134744",
+      "git_commit": "8f9fb2f6717c50f5f0f2e800e2808db3ae9a66fc",
+      "hyperparameters": {
+        "model_type": "bert_enhanced_als",
+        "factors": 64,
+        "projection_method": "svd",
+        "regularization": 0.01,
+        "iterations": 15,
+        "use_gpu": false,
+        "random_state": 42
+      },
+      "metrics": {
+        "recall@5": 0.09,
+        "recall@10": 0.128,
+        "recall@20": 0.188,
+        "ndcg@5": 0.0653,
+        "ndcg@10": 0.0774,
+        "ndcg@20": 0.0924,
+        "evaluation_note": "500 users, leave-one-out, train-only history"
+      },
+      "training_info": {
+        "training_time_seconds": 3.95,
+        "num_train_users": 26050,
+        "num_items": 1423,
+        "num_train_interactions": 30302,
+        "colab_training": true,
+        "bert_initialization": {
+          "enabled": true,
+          "embeddings_path": "data/processed/content_based_embeddings/product_embeddings.pt",
+          "embedding_dim": 1024,
+          "num_products": 2244,
+          "projection_method": "svd",
+          "target_dim": 64,
+          "explained_variance": 0.648
+        },
+        "score_range": {
+          "min": -0.495,
+          "max": 1.048,
+          "mean": 0.002,
+          "std": 0.032,
+          "p01": -0.075,
+          "p99": 0.097
+        }
+      },
+      "status": "active",
+      "baseline_comparison": {
+        "baseline_recall@10": 0.070,
+        "baseline_ndcg@10": 0.033,
+        "improvement_recall10_pct": 108.9,
+        "improvement_ndcg10_pct": 168.4
+      }
+    },
+    "als_20251125_checkpoint": {
+      "model_type": "als",
+      "version": "20251125_checkpoint",
+      "path": "artifacts/cf/als/20251125_checkpoint",
+      "created_at": "2025-11-25T15:17:47",
+      "data_version": "20251124_134744",
+      "git_commit": "8f9fb2f6717c50f5f0f2e800e2808db3ae9a66fc",
+      "hyperparameters": {
+        "factors": 64,
+        "regularization": 0.1,
+        "alpha": 10,
+        "iterations": 15
+      },
+      "metrics": {
+        "recall@10": 0.134,
+        "ndcg@10": 0.085
+      },
+      "training_info": {
+        "source": "checkpoint_import"
+      },
+      "status": "active"
+    }
+  },
+  "bert_embeddings": {
+    "phobert_1024d_20251124": {
+      "version": "20251124",
+      "path": "data/processed/content_based_embeddings/product_embeddings.pt",
+      "created_at": "2025-11-24T00:00:00",
+      "embedding_dim": 1024,
+      "num_products": 2244,
+      "model_name": "vinai/phobert-base",
+      "tokenizer": "vinai/phobert-base",
+      "preprocessing": {
+        "text_fields": ["product_name", "processed_description", "ingredient", "feature"],
+        "separator": " [SEP] ",
+        "max_length": 256
+      },
+      "status": "active"
+    }
+  },
+  "normalization_ranges": {
+    "cf_score": {
+      "min": 0.0,
+      "max": 1.5,
+      "note": "ALS/BPR raw scores"
+    },
+    "content_similarity": {
+      "min": -1.0,
+      "max": 1.0,
+      "note": "Cosine similarity"
+    },
+    "popularity": {
+      "min": 0.0,
+      "max": 6.0,
+      "note": "Log-transformed num_sold_time"
+    },
+    "quality": {
+      "min": 1.0,
+      "max": 5.0,
+      "note": "avg_star rating"
+    }
+  },
+  "reranking_config": {
+    "weights_trainable": {
+      "cf": 0.30,
+      "content": 0.40,
+      "popularity": 0.20,
+      "quality": 0.10
+    },
+    "weights_cold_start": {
+      "content": 0.60,
+      "popularity": 0.30,
+      "quality": 0.10
+    },
+    "diversity": {
+      "enabled": true,
+      "penalty": 0.10,
+      "threshold": 0.85
+    },
+    "user_profile_strategy": "weighted_mean"
+  },
+  "evaluation_results": {
+    "last_evaluated": "2025-11-25T17:09:29",
+    "num_users": 500,
+    "pure_cf": {
+      "recall@10": 0.128,
+      "ndcg@10": 0.0774,
+      "diversity": 0.185,
+      "semantic_alignment": 0.828
+    },
+    "hybrid": {
+      "recall@10": 0.106,
+      "ndcg@10": 0.0674,
+      "diversity": 0.198,
+      "semantic_alignment": 0.818
+    },
+    "improvements": {
+      "diversity_pct": 6.93,
+      "recall@10_pct": -17.19,
+      "ndcg@10_pct": -12.88
+    }
+  },
+  "metadata": {
+    "registry_version": "1.2",
+    "last_updated": "2025-11-25T17:30:00",
+    "num_models": 2,
+    "num_embeddings": 1,
+    "selection_criteria": "recall@10",
+    "data_stats_path": "data/processed/data_stats.json",
+    "config_paths": {
+      "rerank_config": "service/config/rerank_config.yaml",
+      "serving_config": "service/config/serving_config.yaml"
+    }
+  }
+}

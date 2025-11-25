@@ -1,0 +1,130 @@
+# Hybrid Reranking Configuration
+# ================================
+# Configuration for HybridReranker combining CF, content, popularity, quality signals.
+#
+# Strategy: Content-First Hybrid (due to data sparsity ~1.23 interactions/user)
+# - Trainable users (~8.6%): Content (40%) + CF (30%) + Popularity (20%) + Quality (10%)
+# - Cold-start users (~91.4%): Content (60%) + Popularity (30%) + Quality (10%)
+#
+# Last Updated: 2025-11-25
+# Registry Version: 1.2
+# Data Version: 20251124_134744
+
+reranking:
+  # Enable/disable hybrid reranking
+  enabled: true
+  
+  # Candidate multiplier: Generate N * topk candidates for reranking
+  candidate_multiplier: 5
+  
+  # ============================================================================
+  # Weights for trainable users (≥2 interactions)
+  # Evaluated: Recall@10=0.106, Diversity=0.198 (+6.9% vs pure CF)
+  # ============================================================================
+  weights_trainable:
+    cf: 0.30          # SECONDARY - Collaborative filtering score
+    content: 0.40     # PRIMARY - PhoBERT semantic similarity
+    popularity: 0.20  # TERTIARY - Trending/popular items
+    quality: 0.10     # BONUS - High-rated products
+  
+  # ============================================================================
+  # Weights for cold-start users (<2 interactions)
+  # ============================================================================
+  weights_cold_start:
+    content: 0.60     # DOMINANT - Only reliable signal (PhoBERT)
+    popularity: 0.30  # Social proof
+    quality: 0.10     # Bonus for well-reviewed products
+  
+  # ============================================================================
+  # Diversity settings (BERT-based intra-list diversity)
+  # ============================================================================
+  diversity:
+    enabled: true
+    # Penalty factor for similar items (0.0-1.0)
+    penalty: 0.10
+    # BERT similarity threshold above which penalty applies
+    threshold: 0.85
+  
+  # ============================================================================
+  # User profile computation strategy (for content similarity)
+  # ============================================================================
+  # Options: 'mean', 'weighted_mean', 'recency'
+  # - mean: Simple average of history item embeddings
+  # - weighted_mean: Weight by interaction recency/confidence
+  # - recency: Emphasize recent interactions
+  user_profile_strategy: weighted_mean
+  
+  # ============================================================================
+  # Normalization ranges (global, pre-computed from training data)
+  # Source: data/processed/data_stats.json, artifacts/cf/registry.json
+  # ============================================================================
+  normalization:
+    cf:
+      min: 0.0
+      max: 1.5        # ALS/BPR scores typically in [0, 1.5]
+    content:
+      min: -1.0       # Cosine similarity range
+      max: 1.0
+    popularity:
+      # From data_stats.json popularity_range
+      p01: 0.0
+      p99: 6.0        # Log-transformed popularity
+    quality:
+      min: 1.0        # Rating range
+      max: 5.0
+
+# ============================================================================
+# Attribute Boosting Configuration
+# ============================================================================
+attribute_boost:
+  # Brand preferences (multiply final score by factor)
+  brand:
+    Innisfree: 1.15
+    Cetaphil: 1.10
+    CeraVe: 1.12
+    "La Roche-Posay": 1.12
+    Bioderma: 1.10
+    "The Ordinary": 1.08
+  
+  # Skin type preferences (if user's skin type is known)
+  skin_type_standardized:
+    oily: 1.10
+    acne: 1.10
+    sensitive: 1.08
+    dry: 1.08
+    combination: 1.05
+
+# ============================================================================
+# Category Diversity Settings
+# ============================================================================
+category_diversity:
+  # Maximum items per brand in top-K
+  max_per_brand: 3
+  # Maximum items per product type in top-K
+  max_per_type: 4
+  # Enable category-based diversification
+  enabled: true
+
+# ============================================================================
+# Fallback Settings
+# ============================================================================
+fallback:
+  # Default strategy for cold-start users
+  default_strategy: hybrid
+  # Content weight for fallback hybrid
+  content_weight: 0.6
+  # Popularity weight for fallback hybrid
+  popularity_weight: 0.3
+  # Quality weight for fallback hybrid
+  quality_weight: 0.1
+
+# ============================================================================
+# Performance Settings
+# ============================================================================
+performance:
+  # Pre-compute item similarities (trades memory for speed)
+  precompute_item_similarity: false
+  # Cache size for user profiles
+  user_profile_cache_size: 1000
+  # Cache TTL in seconds
+  cache_ttl: 3600

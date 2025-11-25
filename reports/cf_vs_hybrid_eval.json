@@ -1,0 +1,102 @@
+{
+  "cf_only": {
+    "config": {
+      "num_users_evaluated": 500,
+      "k_values": [
+        5,
+        10,
+        20
+      ],
+      "use_rerank": false,
+      "total_time_seconds": 5.385632276535034,
+      "avg_time_per_user_ms": 10.771264553070068
+    },
+    "metrics": {
+      "is_fallback": 0.0,
+      "latency_ms_mean": 9.731301000043459,
+      "latency_ms_std": 3.1166008919648873,
+      "num_recommendations_mean": 20.0,
+      "num_recommendations_std": 0.0,
+      "recall@5_mean": 0.09,
+      "recall@5_std": 0.2861817604250837,
+      "ndcg@5_mean": 0.06526914031159947,
+      "ndcg@5_std": 0.2184343592556392,
+      "recall@10_mean": 0.128,
+      "recall@10_std": 0.33408980828513757,
+      "ndcg@10_mean": 0.07736116242876942,
+      "ndcg@10_std": 0.22330132825587173,
+      "recall@20_mean": 0.188,
+      "recall@20_std": 0.3907121702737195,
+      "ndcg@20_mean": 0.0923991784704746,
+      "ndcg@20_std": 0.226056387603835,
+      "diversity_mean": 0.18498862286868847,
+      "diversity_std": 0.007199565832041774,
+      "semantic_alignment_mean": 0.8279519965794684,
+      "semantic_alignment_std": 0.022390178055062347
+    }
+  },
+  "hybrid": {
+    "config": {
+      "num_users_evaluated": 500,
+      "k_values": [
+        5,
+        10,
+        20
+      ],
+      "use_rerank": true,
+      "total_time_seconds": 31.29253125190735,
+      "avg_time_per_user_ms": 62.5850625038147
+    },
+    "metrics": {
+      "is_fallback": 0.0,
+      "latency_ms_mean": 61.63421460000245,
+      "latency_ms_std": 21.808459469819635,
+      "num_recommendations_mean": 20.0,
+      "num_recommendations_std": 0.0,
+      "recall@5_mean": 0.08,
+      "recall@5_std": 0.2712931993250107,
+      "ndcg@5_mean": 0.05926299475402404,
+      "ndcg@5_std": 0.21232720665976768,
+      "recall@10_mean": 0.106,
+      "recall@10_std": 0.3078376195334157,
+      "ndcg@10_mean": 0.06739907371627764,
+      "ndcg@10_std": 0.21587623808878686,
+      "recall@20_mean": 0.138,
+      "recall@20_std": 0.34489998550304407,
+      "ndcg@20_mean": 0.07557131885195177,
+      "ndcg@20_std": 0.21801595034735247,
+      "diversity_mean": 0.19781152364580257,
+      "diversity_std": 0.005836367095074054,
+      "semantic_alignment_mean": 0.8180543099650688,
+      "semantic_alignment_std": 0.021587771933779157
+    }
+  },
+  "improvements": {
+    "latency_ms_improvement_%": 533.36,
+    "num_recommendations_improvement_%": 0.0,
+    "recall@5_improvement_%": -11.11,
+    "ndcg@5_improvement_%": -9.2,
+    "recall@10_improvement_%": -17.19,
+    "ndcg@10_improvement_%": -12.88,
+    "recall@20_improvement_%": -26.6,
+    "ndcg@20_improvement_%": -18.21,
+    "diversity_improvement_%": 6.93,
+    "semantic_alignment_improvement_%": -1.2
+  },
+  "summary": {
+    "diversity_improvement": 6.93,
+    "recall@10_improvement": -17.19,
+    "ndcg@10_improvement": -12.88,
+    "semantic_alignment_improvement": -1.2
+  },
+  "timestamp": "2025-11-25T17:09:29.643764",
+  "config": {
+    "num_users": 500,
+    "k_values": [
+      5,
+      10,
+      20
+    ],
+    "model_id": "bert_als_20251125_061805"
+  }
+}
