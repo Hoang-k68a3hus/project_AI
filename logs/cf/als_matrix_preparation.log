@@ -1,0 +1,199 @@
+2025-11-23 12:47:12 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:12 - als_matrix_prep - INFO - ALS MATRIX PREPARER INITIALIZED
+2025-11-23 12:47:12 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:12 - als_matrix_prep - INFO - Base path: data\processed
+2025-11-23 12:47:12 - als_matrix_prep - INFO - Normalize confidence: False
+2025-11-23 12:47:12 - als_matrix_prep - INFO - Alpha scaling: 10.0
+2025-11-23 12:47:12 - als_matrix_prep - INFO - Confidence range: [1.0, 6.0]
+2025-11-23 12:47:12 - als_matrix_prep - INFO - 
+================================================================================
+2025-11-23 12:47:12 - als_matrix_prep - INFO - STEP 1.1: LOAD PROCESSED DATA
+2025-11-23 12:47:12 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:12 - als_matrix_prep - INFO - Loading interactions from: data\processed\interactions.parquet
+2025-11-23 12:47:15 - als_matrix_prep - INFO - Loaded 325,189 interactions
+2025-11-23 12:47:15 - als_matrix_prep - INFO - Loading ID mappings from: data\processed\user_item_mappings.json
+2025-11-23 12:47:15 - als_matrix_prep - INFO - Matrix dimensions: (294,857, 1,423)
+2025-11-23 12:47:15 - als_matrix_prep - INFO - ✓ Data loaded successfully
+2025-11-23 12:47:15 - als_matrix_prep - INFO - Filtering to trainable users only (is_trainable_user=True)...
+2025-11-23 12:47:15 - als_matrix_prep - INFO - Filtered: 325,189 → 58,646 interactions (18.03% retained)
+2025-11-23 12:47:15 - als_matrix_prep - INFO - 
+Validating confidence matrix...
+2025-11-23 12:47:15 - als_matrix_prep - INFO - 
+================================================================================
+2025-11-23 12:47:15 - als_matrix_prep - INFO - COMPLETE ALS MATRIX PREPARATION PIPELINE
+2025-11-23 12:47:15 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:15 - als_matrix_prep - INFO - 
+[1/5] Building confidence matrix...
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Filtering to trainable users only (is_trainable_user=True)...
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Filtered: 325,189 → 58,646 interactions (18.03% retained)
+2025-11-23 12:47:16 - als_matrix_prep - INFO - 
+Validating confidence matrix...
+2025-11-23 12:47:16 - als_matrix_prep - INFO - 
+[2/5] Analyzing confidence distribution...
+2025-11-23 12:47:16 - als_matrix_prep - INFO - 
+[3/5] Computing alpha recommendations...
+2025-11-23 12:47:16 - als_matrix_prep - INFO - 
+[4/5] Deriving binary preference matrix...
+2025-11-23 12:47:16 - als_matrix_prep - INFO - 
+[4/5] Deriving continuous preference matrix...
+2025-11-23 12:47:16 - als_matrix_prep - INFO - 
+[5/5] Preparing matrix for implicit library (transpose)...
+2025-11-23 12:47:16 - als_matrix_prep - INFO - 
+Generating training summary...
+2025-11-23 12:47:16 - als_matrix_prep - INFO - 
+================================================================================
+2025-11-23 12:47:16 - als_matrix_prep - INFO - ALS STEP 1 COMPLETE
+2025-11-23 12:47:16 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Matrix shape (user × item):    (294857, 1423)
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Matrix shape (item × user):    (1423, 294857)
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Interactions:                  58,646
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Sparsity:                      99.9860%
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Mean confidence:               5.836
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Confidence range:              [1.000, 6.000]
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Recommended alpha:             10.0
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Current alpha:                 10.0
+2025-11-23 12:47:16 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:16 - als_matrix_prep - INFO - ✓ Ready for ALS training (Step 2)
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Saved confidence matrix: artifacts\cf\als\step1_test\X_train_confidence.npz
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Saved implicit matrix: artifacts\cf\als\step1_test\X_train_implicit.npz
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Saved binary preference: artifacts\cf\als\step1_test\P_binary.npz
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Saved continuous preference: artifacts\cf\als\step1_test\P_continuous.npz
+2025-11-23 12:47:16 - als_matrix_prep - INFO - Saved metadata: artifacts\cf\als\step1_test\step1_metadata.json
+2025-11-23 12:47:16 - als_matrix_prep - INFO - 
+✓ Saved 5 artifacts to artifacts/cf/als/step1_test
+2025-11-23 12:47:17 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:17 - als_matrix_prep - INFO - ALS MATRIX PREPARER INITIALIZED
+2025-11-23 12:47:17 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:17 - als_matrix_prep - INFO - Base path: data\processed
+2025-11-23 12:47:17 - als_matrix_prep - INFO - Normalize confidence: False
+2025-11-23 12:47:17 - als_matrix_prep - INFO - Alpha scaling: 10.0
+2025-11-23 12:47:17 - als_matrix_prep - INFO - Confidence range: [1.0, 6.0]
+2025-11-23 12:47:17 - als_matrix_prep - INFO - 
+================================================================================
+2025-11-23 12:47:17 - als_matrix_prep - INFO - COMPLETE ALS MATRIX PREPARATION PIPELINE
+2025-11-23 12:47:17 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:17 - als_matrix_prep - INFO - 
+[1/5] Building confidence matrix...
+2025-11-23 12:47:17 - als_matrix_prep - INFO - 
+================================================================================
+2025-11-23 12:47:17 - als_matrix_prep - INFO - STEP 1.1: LOAD PROCESSED DATA
+2025-11-23 12:47:17 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:17 - als_matrix_prep - INFO - Loading interactions from: data\processed\interactions.parquet
+2025-11-23 12:47:18 - als_matrix_prep - INFO - Loaded 325,189 interactions
+2025-11-23 12:47:18 - als_matrix_prep - INFO - Loading ID mappings from: data\processed\user_item_mappings.json
+2025-11-23 12:47:19 - als_matrix_prep - INFO - Matrix dimensions: (294,857, 1,423)
+2025-11-23 12:47:19 - als_matrix_prep - INFO - ✓ Data loaded successfully
+2025-11-23 12:47:19 - als_matrix_prep - INFO - Filtering to trainable users only (is_trainable_user=True)...
+2025-11-23 12:47:19 - als_matrix_prep - INFO - Filtered: 325,189 → 58,646 interactions (18.03% retained)
+2025-11-23 12:47:19 - als_matrix_prep - INFO - 
+Validating confidence matrix...
+2025-11-23 12:47:19 - als_matrix_prep - INFO - 
+[2/5] Analyzing confidence distribution...
+2025-11-23 12:47:19 - als_matrix_prep - INFO - 
+[3/5] Computing alpha recommendations...
+2025-11-23 12:47:19 - als_matrix_prep - INFO - 
+[5/5] Preparing matrix for implicit library (transpose)...
+2025-11-23 12:47:19 - als_matrix_prep - INFO - 
+Generating training summary...
+2025-11-23 12:47:19 - als_matrix_prep - INFO - 
+================================================================================
+2025-11-23 12:47:19 - als_matrix_prep - INFO - ALS STEP 1 COMPLETE
+2025-11-23 12:47:19 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:19 - als_matrix_prep - INFO - Matrix shape (user × item):    (294857, 1423)
+2025-11-23 12:47:19 - als_matrix_prep - INFO - Matrix shape (item × user):    (1423, 294857)
+2025-11-23 12:47:19 - als_matrix_prep - INFO - Interactions:                  58,646
+2025-11-23 12:47:19 - als_matrix_prep - INFO - Sparsity:                      99.9860%
+2025-11-23 12:47:19 - als_matrix_prep - INFO - Mean confidence:               5.836
+2025-11-23 12:47:19 - als_matrix_prep - INFO - Confidence range:              [1.000, 6.000]
+2025-11-23 12:47:19 - als_matrix_prep - INFO - Recommended alpha:             10.0
+2025-11-23 12:47:19 - als_matrix_prep - INFO - Current alpha:                 10.0
+2025-11-23 12:47:19 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:19 - als_matrix_prep - INFO - ✓ Ready for ALS training (Step 2)
+2025-11-23 12:47:20 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:20 - als_matrix_prep - INFO - ALS MATRIX PREPARER INITIALIZED
+2025-11-23 12:47:20 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:20 - als_matrix_prep - INFO - Base path: data\processed
+2025-11-23 12:47:20 - als_matrix_prep - INFO - Normalize confidence: False
+2025-11-23 12:47:20 - als_matrix_prep - INFO - Alpha scaling: 10.0
+2025-11-23 12:47:20 - als_matrix_prep - INFO - Confidence range: [1.0, 6.0]
+2025-11-23 12:47:20 - als_matrix_prep - INFO - 
+================================================================================
+2025-11-23 12:47:20 - als_matrix_prep - INFO - STEP 1.1: LOAD PROCESSED DATA
+2025-11-23 12:47:20 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:20 - als_matrix_prep - INFO - Loading interactions from: data\processed\interactions.parquet
+2025-11-23 12:47:21 - als_matrix_prep - INFO - Loaded 325,189 interactions
+2025-11-23 12:47:21 - als_matrix_prep - INFO - Loading ID mappings from: data\processed\user_item_mappings.json
+2025-11-23 12:47:22 - als_matrix_prep - INFO - Matrix dimensions: (294,857, 1,423)
+2025-11-23 12:47:22 - als_matrix_prep - INFO - ✓ Data loaded successfully
+2025-11-23 12:47:22 - als_matrix_prep - INFO - Filtering to trainable users only (is_trainable_user=True)...
+2025-11-23 12:47:22 - als_matrix_prep - INFO - Filtered: 325,189 → 58,646 interactions (18.03% retained)
+2025-11-23 12:47:22 - als_matrix_prep - INFO - 
+Validating confidence matrix...
+2025-11-23 12:47:24 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:24 - als_matrix_prep - INFO - ALS MATRIX PREPARER INITIALIZED
+2025-11-23 12:47:24 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:24 - als_matrix_prep - INFO - Base path: data\processed
+2025-11-23 12:47:24 - als_matrix_prep - INFO - Normalize confidence: True
+2025-11-23 12:47:24 - als_matrix_prep - INFO - Alpha scaling: 40.0
+2025-11-23 12:47:24 - als_matrix_prep - INFO - Confidence range: [1.0, 6.0]
+2025-11-23 12:47:24 - als_matrix_prep - INFO - 
+================================================================================
+2025-11-23 12:47:24 - als_matrix_prep - INFO - STEP 1.1: LOAD PROCESSED DATA
+2025-11-23 12:47:24 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 12:47:24 - als_matrix_prep - INFO - Loading interactions from: data\processed\interactions.parquet
+2025-11-23 12:47:25 - als_matrix_prep - INFO - Loaded 325,189 interactions
+2025-11-23 12:47:25 - als_matrix_prep - INFO - Loading ID mappings from: data\processed\user_item_mappings.json
+2025-11-23 12:47:25 - als_matrix_prep - INFO - Matrix dimensions: (294,857, 1,423)
+2025-11-23 12:47:25 - als_matrix_prep - INFO - ✓ Data loaded successfully
+2025-11-23 12:47:25 - als_matrix_prep - INFO - Filtering to trainable users only (is_trainable_user=True)...
+2025-11-23 12:47:25 - als_matrix_prep - INFO - Filtered: 325,189 → 58,646 interactions (18.03% retained)
+2025-11-23 12:47:25 - als_matrix_prep - INFO - 
+Validating confidence matrix...
+2025-11-23 13:02:02 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 13:02:02 - als_matrix_prep - INFO - ALS MATRIX PREPARER INITIALIZED
+2025-11-23 13:02:02 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 13:02:02 - als_matrix_prep - INFO - Base path: data\processed
+2025-11-23 13:02:02 - als_matrix_prep - INFO - Normalize confidence: False
+2025-11-23 13:02:02 - als_matrix_prep - INFO - Alpha scaling: 10.0
+2025-11-23 13:02:02 - als_matrix_prep - INFO - Confidence range: [1.0, 6.0]
+2025-11-23 13:02:02 - als_matrix_prep - INFO - 
+================================================================================
+2025-11-23 13:02:02 - als_matrix_prep - INFO - COMPLETE ALS MATRIX PREPARATION PIPELINE
+2025-11-23 13:02:02 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 13:02:02 - als_matrix_prep - INFO - 
+[1/5] Building confidence matrix...
+2025-11-23 13:02:02 - als_matrix_prep - INFO - 
+================================================================================
+2025-11-23 13:02:02 - als_matrix_prep - INFO - STEP 1.1: LOAD PROCESSED DATA
+2025-11-23 13:02:02 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 13:02:02 - als_matrix_prep - INFO - Loading interactions from: data\processed\interactions.parquet
+2025-11-23 13:02:03 - als_matrix_prep - INFO - Loaded 325,189 interactions
+2025-11-23 13:02:03 - als_matrix_prep - INFO - Loading ID mappings from: data\processed\user_item_mappings.json
+2025-11-23 13:02:03 - als_matrix_prep - INFO - Matrix dimensions: (294,857, 1,423)
+2025-11-23 13:02:03 - als_matrix_prep - INFO - ✓ Data loaded successfully
+2025-11-23 13:02:03 - als_matrix_prep - INFO - Filtering to trainable users only (is_trainable_user=True)...
+2025-11-23 13:02:03 - als_matrix_prep - INFO - Filtered: 325,189 → 58,646 interactions (18.03% retained)
+2025-11-23 13:02:03 - als_matrix_prep - INFO - 
+Validating confidence matrix...
+2025-11-23 13:02:03 - als_matrix_prep - INFO - 
+[2/5] Analyzing confidence distribution...
+2025-11-23 13:02:04 - als_matrix_prep - INFO - 
+[3/5] Computing alpha recommendations...
+2025-11-23 13:02:04 - als_matrix_prep - INFO - 
+[5/5] Preparing matrix for implicit library (transpose)...
+2025-11-23 13:02:04 - als_matrix_prep - INFO - 
+Generating training summary...
+2025-11-23 13:02:04 - als_matrix_prep - INFO - 
+================================================================================
+2025-11-23 13:02:04 - als_matrix_prep - INFO - ALS STEP 1 COMPLETE
+2025-11-23 13:02:04 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 13:02:04 - als_matrix_prep - INFO - Matrix shape (user × item):    (294857, 1423)
+2025-11-23 13:02:04 - als_matrix_prep - INFO - Matrix shape (item × user):    (1423, 294857)
+2025-11-23 13:02:04 - als_matrix_prep - INFO - Interactions:                  58,646
+2025-11-23 13:02:04 - als_matrix_prep - INFO - Sparsity:                      99.9860%
+2025-11-23 13:02:04 - als_matrix_prep - INFO - Mean confidence:               5.836
+2025-11-23 13:02:04 - als_matrix_prep - INFO - Confidence range:              [1.000, 6.000]
+2025-11-23 13:02:04 - als_matrix_prep - INFO - Recommended alpha:             10.0
+2025-11-23 13:02:04 - als_matrix_prep - INFO - Current alpha:                 10.0
+2025-11-23 13:02:04 - als_matrix_prep - INFO - ================================================================================
+2025-11-23 13:02:04 - als_matrix_prep - INFO - ✓ Ready for ALS training (Step 2)

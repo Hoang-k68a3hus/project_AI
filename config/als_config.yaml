@@ -1,0 +1,225 @@
+# ALS Training Configuration (Task 02 - Step 3)
+# 
+# This configuration file controls ALS model training hyperparameters.
+# Based on Task 02 specifications and project data characteristics:
+# - High sparsity (~1.23 interactions/user)
+# - Rating skew (~95% 5-star ratings)
+# - Trainable users: ≥2 interactions (~26K users, ~8.6%)
+# - Sentiment-enhanced confidence scores (range: 1.0-6.0)
+
+# ============================================================================
+# ALS Model Configuration
+# ============================================================================
+
+als:
+  # Embedding dimension
+  # - Controls the size of user/item latent factor vectors
+  # - Larger values capture more nuanced preferences but risk overfitting
+  # - Recommended: 32 (fast), 64 (balanced), 128 (high quality)
+  factors: 256
+  
+  # L2 Regularization penalty
+  # - Prevents overfitting by penalizing large factor values
+  # - Higher values for sparser data (≥2 interactions threshold)
+  # - Range: 0.001-0.1
+  # - Recommended: 0.01 (default), 0.05-0.1 (sparse data)
+  regularization: 0.01
+  
+  # Number of ALS iterations
+  # - Each iteration alternates between updating user and item factors
+  # - More iterations improve convergence but increase training time
+  # - Recommended: 10-20 iterations
+  iterations: 15
+  
+  # Confidence scaling factor (alpha)
+  # - Scales confidence scores to control trust in positive feedback
+  # - LOWER values (5-10) for sentiment-enhanced confidence (1-6 range)
+  # - HIGHER values (20-40) for normalized confidence (0-1 range)
+  # - Even HIGHER (40-80) for binary confidence
+  alpha: 10
+  
+  # Random seed for reproducibility
+  random_state: 42
+  
+  # GPU acceleration (requires cupy library)
+  # - Set to true if CUDA-capable GPU available
+  # - Significantly speeds up training for large datasets
+  use_gpu: false
+  
+  # Data type for computations
+  # - float32: Faster, less memory, sufficient precision
+  # - float64: Slower, more memory, higher precision (rarely needed)
+  dtype: float32
+  
+  # Number of CPU threads
+  # - 0 means use all available threads
+  # - Set to specific number to limit resource usage
+  num_threads: 0
+
+# ============================================================================
+# Alternative Preset Configurations
+# ============================================================================
+
+# Uncomment and use these presets by passing --preset flag to training script
+
+# Default configuration (same as above)
+# preset: default
+
+# For normalized confidence scores (0-1 range)
+# preset: normalized
+# als:
+#   factors: 64
+#   regularization: 0.01
+#   iterations: 15
+#   alpha: 40  # Higher alpha for normalized range
+
+# For high quality embeddings (longer training)
+# preset: high_quality
+# als:
+#   factors: 128
+#   regularization: 0.05
+#   iterations: 20
+#   alpha: 10
+
+# For fast experimentation
+# preset: fast
+# als:
+#   factors: 32
+#   regularization: 0.01
+#   iterations: 10
+#   alpha: 10
+
+# For very sparse data (≥2 interactions threshold with high sparsity)
+# preset: sparse_data
+# als:
+#   factors: 64
+#   regularization: 0.1  # Higher regularization
+#   iterations: 15
+#   alpha: 5  # Lower alpha
+
+# ============================================================================
+# Training Options
+# ============================================================================
+
+training:
+  # Checkpoint settings
+  checkpoint:
+    # Enable checkpointing
+    enabled: true
+    
+    # Save checkpoint every N iterations
+    interval: 5
+    
+    # Directory for checkpoints (relative to output_dir)
+    directory: checkpoints
+  
+  # Progress tracking
+  progress:
+    # Show progress bar during training
+    show_progress: true
+    
+    # Track memory usage (adds overhead)
+    track_memory: false
+  
+  # Validation settings (optional)
+  validation:
+    # Enable validation metrics during training
+    enabled: false
+    
+    # Compute validation metrics every N iterations
+    interval: 5
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+
+data:
+  # Directory containing processed data from Task 01
+  processed_dir: data/processed
+  
+  # Confidence matrix filename
+  confidence_matrix: X_train_confidence.npz
+  
+  # ID mappings filename
+  mappings: user_item_mappings.json
+  
+  # Data statistics filename
+  stats: data_stats.json
+
+# ============================================================================
+# Output Configuration
+# ============================================================================
+
+output:
+  # Base directory for saving trained models
+  base_dir: artifacts/cf/als
+  
+  # Create timestamped subdirectories
+  use_timestamp: false
+  
+  # Files to save
+  save_user_factors: true
+  save_item_factors: true
+  save_params: true
+  save_metadata: true
+  save_training_summary: true
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+
+logging:
+  # Log level: DEBUG, INFO, WARNING, ERROR
+  level: INFO
+  
+  # Log file path
+  file: logs/cf/als_train.log
+  
+  # Console output
+  console: true
+  
+  # Log format
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# ============================================================================
+# Notes
+# ============================================================================
+
+# Usage Examples:
+#
+# 1. Train with this config:
+#    python scripts/train_als.py --config config/als_config.yaml
+#
+# 2. Override specific parameters:
+#    python scripts/train_als.py --config config/als_config.yaml --factors 128 --alpha 20
+#
+# 3. Use a preset:
+#    python scripts/train_als.py --preset sparse_data
+#
+# 4. Enable GPU:
+#    python scripts/train_als.py --config config/als_config.yaml --use-gpu
+#
+# 5. Enable checkpointing:
+#    python scripts/train_als.py --checkpoint-dir artifacts/cf/als/checkpoints --checkpoint-interval 5
+
+# Hyperparameter Tuning Tips:
+#
+# 1. Alpha (confidence scaling):
+#    - Start with alpha=10 for sentiment-enhanced confidence (1-6 range)
+#    - Increase to 40 if using normalized confidence (0-1 range)
+#    - Experiment with range [5, 10, 20] for raw scores
+#
+# 2. Regularization:
+#    - Start with reg=0.01 for standard data
+#    - Increase to 0.05-0.1 for sparse data (≥2 interactions threshold)
+#    - Higher reg helps anchor sparse user vectors to BERT semantic space
+#
+# 3. Factors (embedding dimension):
+#    - 32: Fast training, good for prototyping
+#    - 64: Balanced performance/quality (recommended starting point)
+#    - 128: High quality, risk of overfitting on sparse data
+#
+# 4. Iterations:
+#    - 10: Fast convergence check
+#    - 15: Standard (recommended)
+#    - 20+: Diminishing returns, check validation metrics

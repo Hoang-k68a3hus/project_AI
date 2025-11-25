@@ -7,7 +7,8 @@ to distinguish high-quality reviews from low-quality ones.
 
 Key Features:
 - AI-powered sentiment analysis using ViSoBERT for Vietnamese text
-- Comment quality scoring based on sentiment and length analysis
+- Batch processing for GPU optimization (up to 10x faster)
+- Comment quality scoring based on sentiment analysis
 - Confidence score computation (rating + comment_quality)
 - GPU acceleration support for efficient inference
 - Handles missing/empty comments gracefully
@@ -60,7 +61,10 @@ class FeatureEngineer:
         positive_threshold: float = 4.0,
         hard_negative_threshold: float = 3.0,
         model_name: str = "5CD-AI/Vietnamese-Sentiment-visobert",
-        device: Optional[str] = None
+        device: Optional[str] = None,
+        batch_size: int = 64,
+        use_ai_sentiment: bool = True,
+        no_comment_quality: float = 0.5
     ):
         """
         Initialize FeatureEngineer with AI sentiment model.
@@ -76,10 +80,16 @@ class FeatureEngineer:
             hard_negative_threshold: Rating threshold for hard negatives (default: 3.0)
             model_name: HuggingFace model identifier for Vietnamese sentiment analysis
             device: Device for model inference ('cuda', 'cpu', or None for auto-detect)
+            batch_size: Batch size for GPU processing (default: 64, increase if you have more VRAM)
+            use_ai_sentiment: Whether to use AI model or fallback to keywords (default: True)
+            no_comment_quality: Default quality score assigned when comment text is missing/empty
         """
         self.positive_threshold = positive_threshold
         self.hard_negative_threshold = hard_negative_threshold
         self.model_name = model_name
+        self.batch_size = batch_size
+        self.use_ai_sentiment = use_ai_sentiment
+        self.no_comment_quality = float(np.clip(no_comment_quality, 0.0, 1.0))
         
         # Setup device (GPU if available, otherwise CPU)
         if device is None:
@@ -87,32 +97,39 @@ class FeatureEngineer:
         else:
             self.device = torch.device(device)
         
-        logger.info(f"Initializing FeatureEngineer with AI sentiment analysis...")
-        logger.info(f"Model: {self.model_name}")
-        logger.info(f"Device: {self.device}")
-        
-        # Load tokenizer and model (only once for efficiency)
-        try:
-            logger.info("Loading tokenizer...")
-            self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-            
-            logger.info("Loading sentiment model...")
-            self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
-            self.model.to(self.device)
-            self.model.eval()  # Set to evaluation mode
-            
-            logger.info("✓ AI sentiment model loaded successfully")
-            
-            # Sentiment label mapping (model-specific)
-            # 5CD-AI/Vietnamese-Sentiment-visobert uses: 0=NEG, 1=POS, 2=NEU
-            self.label_map = {0: "NEGATIVE", 1: "POSITIVE", 2: "NEUTRAL"}
-            self.positive_label_idx = 1
-            
-        except Exception as e:
-            logger.error(f"Failed to load sentiment model: {e}")
-            logger.warning("Falling back to keyword-based sentiment analysis")
+        # Skip model loading if not using AI sentiment
+        if not self.use_ai_sentiment:
+            logger.info(f"Initializing FeatureEngineer with keyword-based sentiment (AI disabled)")
             self.model = None
             self.tokenizer = None
+        else:
+            logger.info(f"Initializing FeatureEngineer with AI sentiment analysis...")
+            logger.info(f"Model: {self.model_name}")
+            logger.info(f"Device: {self.device}")
+            logger.info(f"Batch size: {self.batch_size}")
+            
+            # Load tokenizer and model (only once for efficiency)
+            try:
+                logger.info("Loading tokenizer...")
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                
+                logger.info("Loading sentiment model...")
+                self.model = AutoModelForSequenceClassification.from_pretrained(self.model_name)
+                self.model.to(self.device)
+                self.model.eval()  # Set to evaluation mode
+                
+                logger.info("✓ AI sentiment model loaded successfully")
+                
+                # Sentiment label mapping (model-specific)
+                # 5CD-AI/Vietnamese-Sentiment-visobert uses: 0=NEG, 1=POS, 2=NEU
+                self.label_map = {0: "NEGATIVE", 1: "POSITIVE", 2: "NEUTRAL"}
+                self.positive_label_idx = 1
+                
+            except Exception as e:
+                logger.error(f"Failed to load sentiment model: {e}")
+                logger.warning("Falling back to keyword-based sentiment analysis")
+                self.model = None
+                self.tokenizer = None
             
             # Fallback: Vietnamese positive keywords for cosmetics domain
             self.positive_keywords = [
@@ -122,6 +139,59 @@ class FeatureEngineer:
                 'hài lòng', 'ưng ý', 'tuyệt vời', 'hoàn hảo',
                 'mượt mà', 'tươi sáng', 'ẩm', 'mát', 'dễ chịu'
             ]
+    
+    def compute_sentiment_scores_batch(self, texts: list) -> np.ndarray:
+        """
+        Compute sentiment scores for a batch of texts using AI model (GPU-optimized).
+        
+        This method processes multiple texts at once, maximizing GPU utilization.
+        Much faster than processing one by one.
+        
+        Args:
+            texts: List of review comment texts (Vietnamese)
+        
+        Returns:
+            np.ndarray: Array of sentiment scores [0.0, 1.0] for each text
+        
+        Example:
+            >>> fe = FeatureEngineer(batch_size=64)
+            >>> texts = ["Sản phẩm tốt", "Sản phẩm tệ", "Sản phẩm bình thường"]
+            >>> scores = fe.compute_sentiment_scores_batch(texts)
+            >>> print(scores)  # [0.92, 0.08, 0.45]
+        """
+        # Fallback to keyword-based if model not loaded
+        if self.model is None or self.tokenizer is None:
+            return np.array([self._compute_sentiment_score_keywords(t) for t in texts])
+        
+        try:
+            # Tokenize all texts at once
+            inputs = self.tokenizer(
+                texts,
+                return_tensors="pt",
+                truncation=True,
+                max_length=256,
+                padding=True
+            )
+            
+            # Move inputs to device
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            # Run batch inference (no gradient computation needed)
+            with torch.no_grad():
+                outputs = self.model(**inputs)
+                logits = outputs.logits
+            
+            # Apply softmax to get probabilities
+            probs = torch.softmax(logits, dim=-1)
+            
+            # Extract positive sentiment probabilities for all texts
+            positive_probs = probs[:, self.positive_label_idx].cpu().numpy()
+            
+            return positive_probs
+        
+        except Exception as e:
+            logger.warning(f"Error in batch sentiment analysis: {e}. Returning neutral scores.")
+            return np.full(len(texts), 0.5)  # Neutral scores on error
     
     def compute_sentiment_score_ai(self, text: str) -> float:
         """
@@ -162,11 +232,11 @@ class FeatureEngineer:
         """
         # Handle missing or empty text
         if pd.isna(text) or not isinstance(text, str):
-            return 0.5  # Neutral score for missing data
+            return self.no_comment_quality  # Neutral score for missing data
         
         text_str = text.strip()
         if len(text_str) == 0:
-            return 0.5  # Neutral score for empty text
+            return self.no_comment_quality  # Neutral score for empty text
         
         # Fallback to keyword-based if model not loaded
         if self.model is None or self.tokenizer is None:
@@ -233,6 +303,49 @@ class FeatureEngineer:
         else:
             return min(0.8 + (keyword_matches - 3) * 0.05, 1.0)
     
+    def _compute_quality_scores_batch(self, df: pd.DataFrame, comment_column: str) -> pd.Series:
+        """
+        Compute quality scores for all comments using batch processing (GPU-optimized).
+        
+        This method processes comments in batches to maximize GPU utilization,
+        significantly faster than processing one by one.
+        
+        Args:
+            df: DataFrame with comment column
+            comment_column: Name of the comment column
+        
+        Returns:
+            pd.Series: Quality scores for all comments
+        """
+        from tqdm import tqdm
+        
+        # Prepare all texts
+        comments = df[comment_column].fillna('').astype(str).tolist()
+        quality_scores = np.full(len(comments), self.no_comment_quality, dtype=np.float32)
+        
+        # Process in batches
+        num_batches = (len(comments) + self.batch_size - 1) // self.batch_size
+        
+        with tqdm(total=len(comments), desc="Computing sentiment scores", unit="comments") as pbar:
+            for i in range(0, len(comments), self.batch_size):
+                batch_texts = comments[i:i+self.batch_size]
+                
+                # Filter out empty comments
+                valid_indices = [j for j, text in enumerate(batch_texts) if text.strip()]
+                valid_texts = [batch_texts[j] for j in valid_indices]
+                
+                if valid_texts:
+                    # Compute sentiment scores for valid texts
+                    batch_scores = self.compute_sentiment_scores_batch(valid_texts)
+                    
+                    # Assign scores back to original positions
+                    for local_idx, global_idx in enumerate(valid_indices):
+                        quality_scores[i + global_idx] = batch_scores[local_idx]
+                
+                pbar.update(len(batch_texts))
+        
+        return pd.Series(quality_scores, index=df.index)
+    
     def compute_comment_quality_score(self, comment_text: str) -> float:
         """
         Compute quality score based on AI sentiment analysis.
@@ -260,11 +373,11 @@ class FeatureEngineer:
         """
         # Handle missing or empty comments
         if pd.isna(comment_text):
-            return 0.0
+            return self.no_comment_quality
         
         comment_str = str(comment_text).strip()
         if len(comment_str) == 0:
-            return 0.0
+            return self.no_comment_quality
         
         # Get AI sentiment score (0.0-1.0)
         sentiment_score = self.compute_sentiment_score_ai(comment_str)
@@ -318,9 +431,12 @@ class FeatureEngineer:
                 comment_column = 'comment'
                 logger.info(f"Using 'comment' column instead")
             else:
-                logger.warning("No comment column found - all quality scores will be 0.0")
-                df['comment_quality'] = 0.0
-                df['confidence_score'] = df['rating']
+                logger.warning(
+                    "No comment column found - assigning default quality score %.2f",
+                    self.no_comment_quality
+                )
+                df['comment_quality'] = self.no_comment_quality
+                df['confidence_score'] = df['rating'] + self.no_comment_quality
                 return df, {
                     'comment_column_used': None,
                     'rows_with_comments': 0,
@@ -328,22 +444,28 @@ class FeatureEngineer:
                 }
         
         # Compute comment quality scores
-        logger.info(f"\nComputing AI-powered comment quality scores from '{comment_column}'...")
+        logger.info(f"\nComputing comment quality scores from '{comment_column}'...")
         
         # Check if AI model is loaded
         if self.model is not None:
-            logger.info("Quality scoring method: AI-Powered Sentiment Analysis")
+            logger.info("Quality scoring method: AI-Powered Sentiment Analysis (Batch Processing)")
             logger.info("  - AI Sentiment Score: ViSoBERT Vietnamese sentiment model (5CD-AI)")
-            logger.info("  - Length bonus: +0.1 (≥10 words), +0.2 (≥20 words)")
-            logger.info("  - Note: Length bonus only applied for non-negative sentiment (≥0.4)")
-            logger.info("  - Formula: quality_score = min(sentiment_score + length_bonus, 1.0)")
+            logger.info(f"  - Batch size: {self.batch_size} (GPU-optimized)")
+            logger.info("  - Device: " + str(self.device))
+            logger.info("  - Formula: quality_score = sentiment_score [0.0, 1.0]")
+            
+            # Batch processing for GPU efficiency
+            logger.info(f"\nProcessing {initial_count:,} comments in batches...")
+            df['comment_quality'] = self._compute_quality_scores_batch(df, comment_column)
+            
         else:
             logger.warning("AI model not loaded - using fallback keyword method")
             logger.info("Quality scoring criteria:")
             logger.info("  - Keyword matching: Based on positive word presence")
             logger.info(f"  - Vocabulary: {len(self.positive_keywords)} Vietnamese keywords")
-        
-        df['comment_quality'] = df[comment_column].apply(self.compute_comment_quality_score)
+            
+            # Sequential processing for keyword-based (fast anyway)
+            df['comment_quality'] = df[comment_column].apply(self.compute_comment_quality_score)
         
         # Compute confidence scores
         logger.info("\nComputing confidence scores = rating + comment_quality...")
@@ -483,3 +605,74 @@ class FeatureEngineer:
         max_diff = diff.max()
         
         assert max_diff < 1e-6, f"confidence_score != rating + comment_quality (max diff: {max_diff})"
+    
+    def create_explicit_features(
+        self,
+        df: pd.DataFrame,
+        rating_col: str = 'rating'
+    ) -> pd.DataFrame:
+        """
+        Create explicit feedback features for ALS and BPR (Step 2.1-2.2).
+        
+        This method labels interactions as positive/negative based on rating thresholds
+        to support both ALS (confidence-weighted) and BPR (pairwise ranking) training.
+        
+        Features created:
+        - is_positive: Binary flag (1 if rating >= positive_threshold, else 0)
+        - is_hard_negative: Binary flag (1 if rating <= hard_negative_threshold, else 0)
+        
+        Args:
+            df: DataFrame with interactions (must have rating column)
+            rating_col: Name of the rating column (default: 'rating')
+        
+        Returns:
+            DataFrame with added is_positive and is_hard_negative columns
+        
+        Example:
+            >>> fe = FeatureEngineer(positive_threshold=4, hard_negative_threshold=3)
+            >>> df_labeled = fe.create_explicit_features(df)
+            >>> print(df_labeled['is_positive'].sum())  # Count positive interactions
+        """
+        logger.info("\n" + "="*80)
+        logger.info("STEP 2.1-2.2: EXPLICIT FEEDBACK FEATURE ENGINEERING")
+        logger.info("="*80)
+        
+        # Validate input
+        if rating_col not in df.columns:
+            raise ValueError(f"DataFrame must contain '{rating_col}' column")
+        
+        initial_count = len(df)
+        logger.info(f"Processing {initial_count:,} interactions")
+        logger.info(f"Positive threshold: rating >= {self.positive_threshold}")
+        logger.info(f"Hard negative threshold: rating <= {self.hard_negative_threshold}")
+        
+        # Create positive labels (Step 2.1 - for ALS and BPR positive samples)
+        df['is_positive'] = (df[rating_col] >= self.positive_threshold).astype(int)
+        
+        # Create hard negative labels (Step 2.2 - for BPR hard negative mining)
+        df['is_hard_negative'] = (df[rating_col] <= self.hard_negative_threshold).astype(int)
+        
+        # Compute statistics
+        positive_count = df['is_positive'].sum()
+        hard_neg_count = df['is_hard_negative'].sum()
+        neutral_count = initial_count - positive_count - hard_neg_count
+        
+        # Log summary
+        logger.info("\n" + "="*80)
+        logger.info("EXPLICIT FEEDBACK SUMMARY")
+        logger.info("="*80)
+        logger.info(f"Total interactions:        {initial_count:>12,}")
+        logger.info(f"Positive (≥{self.positive_threshold}):         {positive_count:>12,} ({positive_count/initial_count:.2%})")
+        logger.info(f"Hard Negative (≤{self.hard_negative_threshold}):    {hard_neg_count:>12,} ({hard_neg_count/initial_count:.2%})")
+        logger.info(f"Neutral:                   {neutral_count:>12,} ({neutral_count/initial_count:.2%})")
+        logger.info("="*80 + "\n")
+        
+        # Validate results
+        assert df['is_positive'].notna().all(), "is_positive contains NaN values"
+        assert df['is_hard_negative'].notna().all(), "is_hard_negative contains NaN values"
+        assert df['is_positive'].isin([0, 1]).all(), "is_positive contains non-binary values"
+        assert df['is_hard_negative'].isin([0, 1]).all(), "is_hard_negative contains non-binary values"
+        
+        logger.info("✓ All explicit feedback labels validated")
+        
+        return df

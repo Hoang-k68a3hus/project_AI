@@ -363,6 +363,10 @@ class MatrixBuilder:
         
         # Fill in counts
         for i_idx, count in item_counts.items():
+            # Validate bounds to prevent IndexError
+            if i_idx < 0 or i_idx >= num_items:
+                logger.warning(f"Item index {i_idx} out of bounds [0, {num_items-1}], skipping")
+                continue
             popularity[i_idx] = count
         
         # Apply log-transform if requested

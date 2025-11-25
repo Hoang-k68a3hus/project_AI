@@ -1,0 +1,278 @@
+# BERT-Enhanced ALS Training Configuration (Task 02 - BERT Initialization)
+# 
+# This configuration extends the standard ALS config with BERT initialization
+# to transfer semantic knowledge from PhoBERT embeddings into CF space.
+#
+# CRITICAL for ≥2 Threshold:
+# - With ~26K trainable users (≥2 interactions) and matrix density ~0.11%
+# - BERT initialization prevents random drift for sparse items
+# - Higher regularization (λ=0.1) anchors user vectors to BERT semantic space
+# - Especially important for users with exactly 2 interactions
+
+# ============================================================================
+# BERT-Enhanced ALS Model Configuration
+# ============================================================================
+
+als:
+  # Embedding dimension
+  # - Recommended: 64 (balanced), 128 (high quality with BERT init)
+  # - BERT embeddings (768-dim) will be projected to this dimension
+  factors: 64
+  
+  # L2 Regularization penalty (CRITICAL for BERT init)
+  # - Higher values (0.05-0.1) anchor user vectors to BERT semantic space
+  # - Prevents drift from semantic initialization for sparse users
+  # - Recommended: 0.1 for ≥2 threshold, 0.05 for ≥3 threshold
+  regularization: 0.1
+  
+  # Number of ALS iterations
+  # - BERT init may converge faster than random init
+  # - Recommended: 15 iterations (same as standard ALS)
+  iterations: 15
+  
+  # Confidence scaling factor (alpha)
+  # - Use 10 for sentiment-enhanced confidence (1-6 range)
+  # - Use 40 for normalized confidence (0-1 range)
+  alpha: 10
+  
+  # Random seed for reproducibility
+  random_state: 42
+  
+  # GPU acceleration (requires cupy library)
+  use_gpu: false
+  
+  # Data type for computations
+  dtype: float32
+  
+  # Number of CPU threads
+  num_threads: 0
+
+# ============================================================================
+# BERT Initialization Configuration
+# ============================================================================
+
+bert_init:
+  # Enable BERT initialization (set to false to use standard random init)
+  enabled: true
+  
+  # Path to PhoBERT product embeddings
+  # Expected format: PyTorch file (.pt) with:
+  #   - 'embeddings': torch.Tensor (num_items, 768)
+  #   - 'product_ids': list of product IDs
+  embeddings_path: data/processed/content_based_embeddings/product_embeddings.pt
+  
+  # Projection method for dimensionality reduction
+  # Options: "svd" (recommended, faster) or "pca" (alternative)
+  projection_method: svd
+  
+  # Freeze item factors for first iteration (experimental)
+  # - If true, item factors stay fixed for first iteration
+  # - Allows user factors to align with BERT semantic space
+  # - Note: May not be supported by all implicit library versions
+  freeze_first_iter: false
+
+# ============================================================================
+# Alternative Preset Configurations
+# ============================================================================
+
+# High regularization for very sparse data (≥2 interactions)
+# Uncomment to use: python scripts/train_bert_als.py --preset high_reg
+# preset: high_reg
+# als:
+#   factors: 64
+#   regularization: 0.15  # Very high regularization
+#   iterations: 15
+#   alpha: 10
+
+# High quality embeddings (larger dimension)
+# Uncomment to use: python scripts/train_bert_als.py --preset high_quality
+# preset: high_quality
+# als:
+#   factors: 128
+#   regularization: 0.1
+#   iterations: 20
+#   alpha: 10
+
+# Fast experimentation (lower dimension)
+# Uncomment to use: python scripts/train_bert_als.py --preset fast
+# preset: fast
+# als:
+#   factors: 32
+#   regularization: 0.1
+#   iterations: 10
+#   alpha: 10
+
+# ============================================================================
+# Training Options
+# ============================================================================
+
+training:
+  # Checkpoint settings
+  checkpoint:
+    enabled: true
+    interval: 5
+    directory: checkpoints
+  
+  # Progress tracking
+  progress:
+    show_progress: true
+    track_memory: false
+  
+  # Validation settings
+  validation:
+    enabled: false
+    interval: 5
+
+# ============================================================================
+# Data Configuration
+# ============================================================================
+
+data:
+  # Directory containing processed data from Task 01
+  processed_dir: data/processed
+  
+  # Confidence matrix filename (sentiment-enhanced)
+  confidence_matrix: X_train_confidence.npz
+  
+  # ID mappings filename
+  mappings: user_item_mappings.json
+  
+  # Data statistics filename
+  stats: data_stats.json
+
+# ============================================================================
+# Output Configuration
+# ============================================================================
+
+output:
+  # Base directory for saving trained models
+  # BERT-enhanced models saved separately from standard ALS
+  base_dir: artifacts/cf/bert_als
+  
+  # Create timestamped subdirectories
+  use_timestamp: true
+  
+  # Files to save
+  save_user_factors: true
+  save_item_factors: true
+  save_params: true
+  save_metadata: true
+  save_training_summary: true
+  
+  # Additional BERT-specific outputs
+  save_projection_info: true
+  save_alignment_stats: true
+
+# ============================================================================
+# Evaluation Configuration (Task 03)
+# ============================================================================
+
+evaluation:
+  # Metrics to compute
+  metrics: ["recall", "ndcg"]
+  
+  # K values for Recall@K and NDCG@K
+  k_values: [10, 20]
+  
+  # Compare with baselines
+  compare_baselines:
+    # Standard random-init ALS
+    - type: als_random
+      path: artifacts/cf/als
+    
+    # Popularity baseline
+    - type: popularity
+  
+  # Evaluate cold-start item performance separately
+  cold_start_analysis:
+    enabled: true
+    # Items with < threshold interactions considered cold-start
+    interaction_threshold: 5
+
+# ============================================================================
+# Logging Configuration
+# ============================================================================
+
+logging:
+  level: INFO
+  file: logs/cf/bert_als_train.log
+  console: true
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
+# ============================================================================
+# Score Range Computation (for Task 08 Hybrid Reranking)
+# ============================================================================
+
+score_range:
+  # Compute score range for global normalization
+  enabled: true
+  
+  # Sample size for computing statistics (to avoid memory issues)
+  sample_size: 1000
+  
+  # Whether to use validation set for scoring (if available)
+  use_validation_set: false
+
+# ============================================================================
+# Usage Examples
+# ============================================================================
+
+# 1. Train with BERT initialization:
+#    python scripts/train_bert_als.py --config config/bert_als_config.yaml
+#
+# 2. Override regularization:
+#    python scripts/train_bert_als.py --config config/bert_als_config.yaml --regularization 0.15
+#
+# 3. Disable BERT init (use random):
+#    python scripts/train_bert_als.py --config config/bert_als_config.yaml --no-bert-init
+#
+# 4. Use different projection method:
+#    python scripts/train_bert_als.py --projection-method pca
+#
+# 5. Train with GPU:
+#    python scripts/train_bert_als.py --config config/bert_als_config.yaml --use-gpu
+
+# ============================================================================
+# Hyperparameter Tuning Tips for BERT-Init
+# ============================================================================
+
+# 1. Regularization (MOST IMPORTANT):
+#    - Start with 0.1 for ≥2 threshold (high sparsity)
+#    - Increase to 0.15 if user vectors drift too far from BERT space
+#    - Decrease to 0.05 if model underfits
+#    - Monitor: Compare item factor similarity before/after training
+#
+# 2. Factors (Embedding Dimension):
+#    - 64: Good balance, BERT semantic knowledge still preserved
+#    - 128: Higher capacity, may capture more nuances
+#    - 32: Too small, loses BERT semantic information
+#
+# 3. Alpha (Confidence Scaling):
+#    - Keep at 10 for sentiment-enhanced confidence (1-6 range)
+#    - Experiment with [5, 10, 20] if needed
+#    - Lower alpha = more trust in BERT semantic space
+#
+# 4. Projection Method:
+#    - SVD (default): Faster, preserves variance well
+#    - PCA: Alternative, similar results
+#
+# 5. Grid Search Strategy:
+#    - Stage 1: Fix factors=64, alpha=10
+#      - Tune regularization: [0.05, 0.1, 0.15]
+#    - Stage 2: Best reg from Stage 1
+#      - Tune factors: [32, 64, 128]
+#    - Stage 3: Best reg+factors
+#      - Tune alpha: [5, 10, 20]
+
+# ============================================================================
+# Expected Performance Improvements
+# ============================================================================
+
+# Compared to random-init ALS:
+# - Cold-start items (< 5 interactions): +15-25% Recall@10
+# - Regular items: +5-10% Recall@10
+# - Overall: +8-15% Recall@10
+# - NDCG@10: Similar improvements
+#
+# Training time: Similar to random-init (projection overhead ~1-2s)
+# Memory: Same as random-init ALS

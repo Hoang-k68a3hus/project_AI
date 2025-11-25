@@ -1,0 +1,127 @@
+# Alert Configuration
+# ===================
+
+# Alert Definitions
+alerts:
+  - name: "high_latency"
+    metric: "avg_latency_ms"
+    threshold: 200
+    window: "5min"
+    severity: "warning"
+    action: "log"
+    description: "Average latency exceeds 200ms"
+  
+  - name: "critical_latency"
+    metric: "p95_latency_ms"
+    threshold: 500
+    window: "5min"
+    severity: "critical"
+    action: "email+slack"
+    description: "P95 latency exceeds 500ms"
+  
+  - name: "high_error_rate"
+    metric: "error_rate"
+    threshold: 0.05  # 5%
+    window: "5min"
+    severity: "critical"
+    action: "email+slack"
+    description: "Error rate exceeds 5%"
+  
+  - name: "high_fallback_rate"
+    metric: "fallback_rate"
+    threshold: 0.95  # 95%
+    window: "1hour"
+    severity: "warning"
+    action: "log"
+    description: "Fallback rate too high - most users not getting CF recommendations"
+  
+  - name: "low_traffic"
+    metric: "requests_per_minute"
+    threshold: 0
+    window: "5min"
+    severity: "warning"
+    action: "log"
+    description: "No requests received"
+  
+  - name: "data_drift"
+    metric: "drift_detected"
+    threshold: true
+    window: "weekly"
+    severity: "info"
+    action: "email"
+    description: "Data distribution has drifted significantly"
+
+# Email Configuration
+email:
+  enabled: false
+  smtp_server: "smtp.gmail.com"
+  smtp_port: 587
+  sender: "alerts@example.com"
+  recipients:
+    - "team@example.com"
+  # Password should be set via EMAIL_PASSWORD environment variable
+
+# Slack Configuration
+slack:
+  enabled: false
+  webhook_url: null  # Set via environment variable or update here
+  channel: "#cf-alerts"
+
+# Logging Configuration
+logging:
+  enabled: true
+  log_path: "logs/service/alerts.log"
+  log_level: "INFO"
+
+# Check Intervals
+intervals:
+  health_check_seconds: 60      # Check service health every minute
+  drift_check_hours: 168        # Check for drift weekly
+  alert_cooldown_minutes: 30    # Minimum time between repeated alerts
+
+# Thresholds for Retrain Decision
+retrain_triggers:
+  rating_drift_pvalue: 0.05     # KS test p-value threshold
+  popularity_correlation: 0.8   # Spearman correlation threshold
+  data_age_days: 30             # Max age of training data
+  ctr_drop_percent: 10          # Max acceptable CTR drop
+  embedding_age_days: 30        # Max age of BERT embeddings
+
+# Notification Templates
+templates:
+  high_latency: |
+    ⚠️ High Latency Alert
+    
+    Current average latency: {value:.1f}ms
+    Threshold: {threshold}ms
+    Model: {model_id}
+    Time: {timestamp}
+  
+  high_error_rate: |
+    🚨 Critical Error Rate Alert
+    
+    Current error rate: {value:.1%}
+    Threshold: {threshold:.1%}
+    Errors in last 5 minutes: {error_count}
+    Model: {model_id}
+    
+    Action Required: Check service logs for errors.
+  
+  data_drift: |
+    📊 Data Drift Detected
+    
+    Rating distribution has shifted significantly.
+    KS Test p-value: {p_value:.4f}
+    Historical mean: {historical_mean:.2f}
+    Current mean: {new_mean:.2f}
+    
+    Recommendation: Consider retraining the model.
+  
+  retrain_needed: |
+    🔄 Model Retrain Recommended
+    
+    Reasons:
+    {reasons}
+    
+    Last training: {last_training_date}
+    Current model: {model_id}

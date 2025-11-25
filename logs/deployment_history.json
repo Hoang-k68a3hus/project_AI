@@ -1,0 +1,22 @@
+{
+  "deployments": [
+    {
+      "model_id": {
+        "model_id": "bert_als_20251125_061805",
+        "model_type": "bert_als",
+        "version": "20251125_061805",
+        "path": "artifacts/cf/bert_als/20251125_061805",
+        "selection_metric": "recall@10",
+        "selection_value": 0.14569197285878888,
+        "selected_at": "2025-11-25T15:17:47.390947",
+        "selected_by": "auto"
+      },
+      "deployed_at": "2025-11-25T16:09:17.033412",
+      "status": "failed",
+      "git_commit": "8f9fb2f6",
+      "metadata": {
+        "error": "string indices must be integers, not 'str'"
+      }
+    }
+  ]
+}

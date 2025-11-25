@@ -136,7 +136,8 @@ class IDMapper:
         self,
         interactions_df: pd.DataFrame,
         user_col: str = 'user_id',
-        item_col: str = 'product_id'
+        item_col: str = 'product_id',
+        inplace: bool = False
     ) -> pd.DataFrame:
         """
         Apply mappings to interactions DataFrame.
@@ -145,6 +146,7 @@ class IDMapper:
             interactions_df: DataFrame with user_id and product_id columns
             user_col: User ID column
             item_col: Item ID column
+            inplace: If False, return a copy. If True, modify original DataFrame.
         
         Returns:
             DataFrame with added u_idx and i_idx columns
@@ -159,6 +161,10 @@ class IDMapper:
         
         if not self.user_to_idx or not self.item_to_idx:
             raise ValueError("Mappings not created. Call create_mappings() first.")
+        
+        # Copy DataFrame if not inplace to avoid modifying original
+        if not inplace:
+            interactions_df = interactions_df.copy()
         
         # Map user IDs
         interactions_df['u_idx'] = interactions_df[user_col].map(self.user_to_idx)
@@ -236,11 +242,19 @@ class IDMapper:
         Returns:
             MD5 hash string
         """
+        # Determine which columns to use for hashing
+        base_cols = ['user_id', 'product_id']
+        hash_cols = base_cols.copy()
+        
+        # Add rating column if it exists
+        if 'rating' in interactions_df.columns:
+            hash_cols.append('rating')
+        
         # Sort DataFrame for consistent hashing
-        df_sorted = interactions_df.sort_values(['user_id', 'product_id', 'rating']).reset_index(drop=True)
+        df_sorted = interactions_df.sort_values(hash_cols).reset_index(drop=True)
         
         # Compute hash of key columns
-        hash_input = df_sorted[['user_id', 'product_id', 'rating']].to_string()
+        hash_input = df_sorted[hash_cols].to_string()
         data_hash = hashlib.md5(hash_input.encode('utf-8')).hexdigest()
         
         return data_hash
@@ -325,20 +339,41 @@ class IDMapper:
         Args:
             input_path: Path to JSON file
         
+        Raises:
+            FileNotFoundError: If file doesn't exist
+            ValueError: If file format is invalid
+        
         Example:
             >>> mapper = IDMapper()
             >>> mapper.load_mappings('data/processed/user_item_mappings.json')
         """
+        import os
+        
         logger.info(f"\nLoading mappings from: {input_path}")
         
-        with open(input_path, 'r', encoding='utf-8') as f:
-            mappings_data = json.load(f)
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(f"Mapping file not found: {input_path}")
+        
+        try:
+            with open(input_path, 'r', encoding='utf-8') as f:
+                mappings_data = json.load(f)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON format in {input_path}: {e}")
+        
+        # Validate required keys
+        required_keys = ['user_to_idx', 'idx_to_user', 'item_to_idx', 'idx_to_item']
+        missing_keys = [key for key in required_keys if key not in mappings_data]
+        if missing_keys:
+            raise ValueError(f"Missing required keys in mapping file: {missing_keys}")
         
         # Convert string keys back to integers
-        self.user_to_idx = {int(k): v for k, v in mappings_data['user_to_idx'].items()}
-        self.idx_to_user = {int(k): v for k, v in mappings_data['idx_to_user'].items()}
-        self.item_to_idx = {int(k): v for k, v in mappings_data['item_to_idx'].items()}
-        self.idx_to_item = {int(k): v for k, v in mappings_data['idx_to_item'].items()}
+        try:
+            self.user_to_idx = {int(k): v for k, v in mappings_data['user_to_idx'].items()}
+            self.idx_to_user = {int(k): v for k, v in mappings_data['idx_to_user'].items()}
+            self.item_to_idx = {int(k): v for k, v in mappings_data['item_to_idx'].items()}
+            self.idx_to_item = {int(k): v for k, v in mappings_data['idx_to_item'].items()}
+        except (ValueError, KeyError) as e:
+            raise ValueError(f"Error parsing mapping data: {e}")
         
         self.num_users = len(self.user_to_idx)
         self.num_items = len(self.item_to_idx)
@@ -346,10 +381,11 @@ class IDMapper:
         if 'metadata' in mappings_data:
             self.metadata = mappings_data['metadata']
             logger.info(f"  Loaded metadata:")
-            logger.info(f"    - Created at: {self.metadata['created_at']}")
-            logger.info(f"    - Num users: {self.metadata['num_users']:,}")
-            logger.info(f"    - Num items: {self.metadata['num_items']:,}")
-            logger.info(f"    - Data hash: {self.metadata['data_hash'][:8]}...")
+            logger.info(f"    - Created at: {self.metadata.get('created_at', 'N/A')}")
+            logger.info(f"    - Num users: {self.metadata.get('num_users', self.num_users):,}")
+            logger.info(f"    - Num items: {self.metadata.get('num_items', self.num_items):,}")
+            if 'data_hash' in self.metadata:
+                logger.info(f"    - Data hash: {self.metadata['data_hash'][:8]}...")
         
         logger.info(f"✓ Loaded {self.num_users:,} user mappings, {self.num_items:,} item mappings")
     
@@ -421,10 +457,24 @@ class IDMapper:
             u_indices: Array-like of u_idx values
         
         Returns:
-            List of original user_ids
+            List of original user_ids (or single value if input is int)
+        
+        Raises:
+            KeyError: If any index is not found in mappings
         """
+        if not self.idx_to_user:
+            raise ValueError("Mappings not created. Call create_mappings() first.")
+        
         if isinstance(u_indices, (int, np.integer)):
+            if u_indices not in self.idx_to_user:
+                raise KeyError(f"User index {u_indices} not found in mappings (valid range: 0-{self.num_users-1})")
             return self.idx_to_user[u_indices]
+        
+        # Check for invalid indices
+        invalid_indices = [u_idx for u_idx in u_indices if u_idx not in self.idx_to_user]
+        if invalid_indices:
+            raise KeyError(f"User indices not found in mappings: {invalid_indices} (valid range: 0-{self.num_users-1})")
+        
         return [self.idx_to_user[u_idx] for u_idx in u_indices]
     
     def reverse_item_mapping(self, i_indices) -> list:
@@ -435,8 +485,22 @@ class IDMapper:
             i_indices: Array-like of i_idx values
         
         Returns:
-            List of original product_ids
+            List of original product_ids (or single value if input is int)
+        
+        Raises:
+            KeyError: If any index is not found in mappings
         """
+        if not self.idx_to_item:
+            raise ValueError("Mappings not created. Call create_mappings() first.")
+        
         if isinstance(i_indices, (int, np.integer)):
+            if i_indices not in self.idx_to_item:
+                raise KeyError(f"Item index {i_indices} not found in mappings (valid range: 0-{self.num_items-1})")
             return self.idx_to_item[i_indices]
+        
+        # Check for invalid indices
+        invalid_indices = [i_idx for i_idx in i_indices if i_idx not in self.idx_to_item]
+        if invalid_indices:
+            raise KeyError(f"Item indices not found in mappings: {invalid_indices} (valid range: 0-{self.num_items-1})")
+        
         return [self.idx_to_item[i_idx] for i_idx in i_indices]

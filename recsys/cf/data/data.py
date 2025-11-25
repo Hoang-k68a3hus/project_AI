@@ -12,6 +12,7 @@ Key Features:
 """
 
 import os
+import sys
 import logging
 from datetime import datetime
 from typing import Dict, Tuple
@@ -57,8 +58,42 @@ def setup_logging(log_file: str = "logs/cf/data_processing.log") -> logging.Logg
     file_handler = logging.FileHandler(log_file, encoding='utf-8')
     file_handler.setLevel(logging.INFO)
     
-    # Console handler
-    console_handler = logging.StreamHandler()
+    # Console handler with UTF-8 encoding support for Windows
+    # Wrap stdout/stderr to handle Unicode on Windows
+    if sys.platform == 'win32':
+        # On Windows, try to set console to UTF-8 if possible
+        try:
+            # Try to set console code page to UTF-8 (Windows 10+)
+            import subprocess
+            subprocess.run(['chcp', '65001'], shell=True, capture_output=True, check=False)
+        except Exception:
+            pass
+        
+        # Use a wrapper that handles encoding errors gracefully
+        class UnicodeStreamHandler(logging.StreamHandler):
+            def emit(self, record):
+                try:
+                    msg = self.format(record)
+                    # Replace Unicode checkmark with ASCII equivalent
+                    msg = msg.replace('\u2713', '[OK]').replace('\u2717', '[X]')
+                    stream = self.stream
+                    stream.write(msg + self.terminator)
+                    self.flush()
+                except UnicodeEncodeError:
+                    # Fallback: encode to ASCII with error handling
+                    try:
+                        msg = self.format(record)
+                        msg = msg.encode('ascii', 'replace').decode('ascii')
+                        stream = self.stream
+                        stream.write(msg + self.terminator)
+                        self.flush()
+                    except Exception:
+                        self.handleError(record)
+        
+        console_handler = UnicodeStreamHandler(sys.stdout)
+    else:
+        console_handler = logging.StreamHandler()
+    
     console_handler.setLevel(logging.INFO)
     
     # Formatter
@@ -102,7 +137,10 @@ class DataProcessor:
         rating_max: float = 5.0,
         drop_missing_timestamps: bool = True,
         positive_threshold: float = 4.0,
-        hard_negative_threshold: float = 3.0
+        hard_negative_threshold: float = 3.0,
+        implicit_negative_per_user: int = 50,
+        implicit_negative_strategy: str = 'popular',
+        no_comment_quality: float = 0.5
     ):
         """
         Initialize DataProcessor.
@@ -114,6 +152,9 @@ class DataProcessor:
             drop_missing_timestamps: If True, drop rows with NaT timestamps (default: True)
             positive_threshold: Rating threshold for positive interactions (default: 4.0)
             hard_negative_threshold: Rating threshold for hard negatives (default: 3.0)
+            implicit_negative_per_user: Number of implicit negatives to sample per user for eval
+            implicit_negative_strategy: Strategy for implicit negatives ('popular' or 'random')
+            no_comment_quality: Default quality score when comments are missing/empty
         """
         self.reader = DataReader(base_path=base_path)
         self.auditor = DataAuditor(
@@ -123,7 +164,8 @@ class DataProcessor:
         )
         self.feature_engineer = FeatureEngineer(
             positive_threshold=positive_threshold,
-            hard_negative_threshold=hard_negative_threshold
+            hard_negative_threshold=hard_negative_threshold,
+            no_comment_quality=no_comment_quality
         )
         self.als_preparer = ALSDataPreparer(
             normalize_confidence=False,
@@ -147,7 +189,13 @@ class DataProcessor:
         self.id_mapper = IDMapper()
         
         # Step 4: Temporal Split (Leave-One-Out)
-        self.temporal_splitter = TemporalSplitter(positive_threshold=positive_threshold)
+        self.temporal_splitter = TemporalSplitter(
+            positive_threshold=positive_threshold,
+            include_negative_holdout=True,
+            hard_negative_threshold=hard_negative_threshold,
+            implicit_negative_per_user=implicit_negative_per_user,
+            implicit_negative_strategy=implicit_negative_strategy
+        )
         
         # Step 5: Matrix Construction
         self.matrix_builder = MatrixBuilder(
@@ -361,6 +409,118 @@ class DataProcessor:
         """
         return self.als_preparer.get_confidence_distribution(interactions_df)
     
+    def derive_binary_preference_matrix(
+        self,
+        X_confidence,
+        threshold: float = 4.5
+    ):
+        """
+        Derive binary preference matrix from confidence matrix (Step 1.3).
+        
+        Args:
+            X_confidence: Confidence CSR matrix
+            threshold: Confidence threshold for binary preference
+        
+        Returns:
+            csr_matrix: Binary preference matrix
+        
+        Example:
+            >>> X_conf, _ = processor.prepare_als_matrix(train_df, 26000, 2231)
+            >>> P_binary = processor.derive_binary_preference_matrix(X_conf, threshold=4.5)
+        """
+        return self.als_preparer.derive_binary_preference_matrix(X_confidence, threshold)
+    
+    def derive_continuous_preference_matrix(
+        self,
+        X_confidence,
+        normalize_to_01: bool = True
+    ):
+        """
+        Derive continuous preference matrix from confidence (Step 1.3).
+        
+        Args:
+            X_confidence: Confidence CSR matrix
+            normalize_to_01: If True, normalize to [0, 1] range
+        
+        Returns:
+            csr_matrix: Continuous preference matrix
+        
+        Example:
+            >>> X_conf, _ = processor.prepare_als_matrix(train_df, 26000, 2231)
+            >>> P_cont = processor.derive_continuous_preference_matrix(X_conf)
+        """
+        return self.als_preparer.derive_continuous_preference_matrix(
+            X_confidence, normalize_to_01
+        )
+    
+    def get_recommended_alpha(
+        self,
+        X_confidence,
+        is_normalized: bool = False
+    ):
+        """
+        Get recommended alpha values for ALS training (Step 1.2).
+        
+        Args:
+            X_confidence: Confidence CSR matrix
+            is_normalized: Whether confidence is normalized to [0, 1]
+        
+        Returns:
+            Dict with recommended alpha values and rationale
+        
+        Example:
+            >>> X_conf, _ = processor.prepare_als_matrix(train_df, 26000, 2231)
+            >>> recommendations = processor.get_recommended_alpha(X_conf, is_normalized=False)
+            >>> print(f"Recommended alpha: {recommendations['recommended']}")
+        """
+        return self.als_preparer.get_recommended_alpha(X_confidence, is_normalized)
+    
+    def prepare_als_for_implicit_library(
+        self,
+        X_confidence,
+        transpose: bool = True
+    ):
+        """
+        Prepare matrix for implicit library (expects item-user format).
+        
+        Args:
+            X_confidence: Confidence matrix (user-item format)
+            transpose: If True, transpose to item-user format
+        
+        Returns:
+            csr_matrix: Matrix in implicit library format
+        
+        Example:
+            >>> X_conf, _ = processor.prepare_als_matrix(train_df, 26000, 2231)
+            >>> X_train = processor.prepare_als_for_implicit_library(X_conf)
+            >>> print(X_train.shape)  # (2231, 26000) - transposed
+        """
+        return self.als_preparer.prepare_for_implicit_library(X_confidence, transpose)
+    
+    def get_als_training_summary(
+        self,
+        X_confidence,
+        alpha: float = 40.0,
+        normalize: bool = False
+    ):
+        """
+        Get comprehensive ALS training summary (Step 1 complete).
+        
+        Args:
+            X_confidence: Confidence matrix
+            alpha: Alpha scaling factor
+            normalize: Whether confidence is normalized
+        
+        Returns:
+            Dict with all training preparation statistics
+        
+        Example:
+            >>> X_conf, _ = processor.prepare_als_matrix(train_df, 26000, 2231)
+            >>> summary = processor.get_als_training_summary(X_conf, alpha=10.0)
+            >>> print(f"Recommended alpha: {summary['recommended_alpha']}")
+        """
+        return self.als_preparer.get_als_training_summary(X_confidence, alpha, normalize)
+    
     def prepare_bpr_labels(
         self,
         interactions_df: pd.DataFrame,
@@ -403,15 +563,111 @@ class DataProcessor:
         interactions_df: pd.DataFrame
     ):
         """
-        Build user positive item sets for BPR negative sampling.
+        Build user positive item sets for BPR negative sampling (Step 1.1).
         
         Args:
             interactions_df: DataFrame with is_positive column
         
         Returns:
             Dict mapping user_idx -> Set of positive item indices
+        
+        Example:
+            >>> user_pos_sets = processor.build_bpr_positive_sets(train_df)
+            >>> print(f"Users with positives: {len(user_pos_sets):,}")
+            >>> print(f"Sample user 0 positives: {len(user_pos_sets.get(0, set()))} items")
         """
         return self.bpr_preparer.build_positive_sets(interactions_df)
+    
+    def build_bpr_positive_pairs(
+        self,
+        interactions_df: pd.DataFrame,
+        user_col: str = 'u_idx',
+        item_col: str = 'i_idx'
+    ):
+        """
+        Build positive pairs list from DataFrame for BPR training (Step 1.2).
+        
+        Args:
+            interactions_df: DataFrame with 'is_positive' column
+            user_col: User index column
+            item_col: Item index column
+        
+        Returns:
+            Tuple[np.ndarray, Dict]:
+                - Array of shape (N, 2) with columns [u_idx, i_idx]
+                - Statistics dictionary
+        
+        Example:
+            >>> pairs, stats = processor.build_bpr_positive_pairs(train_df)
+            >>> print(f"Total pairs: {len(pairs):,}")
+            >>> print(f"Pairs shape: {pairs.shape}")
+        """
+        return self.bpr_preparer.build_positive_pairs(
+            interactions_df, user_col, item_col
+        )
+    
+    def build_bpr_positive_pairs_from_sets(
+        self,
+        user_pos_sets
+    ):
+        """
+        Build positive pairs list from user positive sets (Step 1.2 alternative).
+        
+        Args:
+            user_pos_sets: Dict mapping u_idx -> Set of positive i_idx
+        
+        Returns:
+            Tuple[np.ndarray, Dict]:
+                - Array of shape (N, 2) with columns [u_idx, i_idx]
+                - Statistics dictionary
+        
+        Example:
+            >>> user_pos_sets = processor.build_bpr_positive_sets(train_df)
+            >>> pairs, stats = processor.build_bpr_positive_pairs_from_sets(user_pos_sets)
+        """
+        return self.bpr_preparer.build_positive_pairs_from_sets(user_pos_sets)
+    
+    def get_bpr_training_data(
+        self,
+        interactions_df: pd.DataFrame,
+        products_df: pd.DataFrame = None,
+        user_col: str = 'u_idx',
+        item_col: str = 'i_idx',
+        rating_col: str = 'rating'
+    ):
+        """
+        Get complete BPR training data (Step 1 complete).
+        
+        Orchestrates the full data preparation pipeline:
+        1. Create positive labels (is_positive column)
+        2. Build positive sets (user -> set of positive items)
+        3. Build positive pairs (array of [u, i] for training)
+        4. Mine hard negatives (explicit + implicit)
+        
+        Args:
+            interactions_df: DataFrame with user-item interactions
+            products_df: Optional product metadata for implicit negative mining
+            user_col: User index column
+            item_col: Item index column
+            rating_col: Rating column
+        
+        Returns:
+            Dict containing:
+                - 'positive_pairs': np.ndarray of shape (N, 2)
+                - 'user_pos_sets': Dict[u_idx, Set[i_idx]]
+                - 'hard_neg_sets': Dict[u_idx, Set[i_idx]]
+                - 'num_users': Total number of users
+                - 'num_items': Total number of items
+                - 'stats': Comprehensive statistics
+        
+        Example:
+            >>> data = processor.get_bpr_training_data(train_df, products_df)
+            >>> print(f"Positive pairs: {len(data['positive_pairs']):,}")
+            >>> print(f"Users with hard negatives: {len(data['hard_neg_sets']):,}")
+        """
+        return self.bpr_preparer.get_bpr_training_data(
+            interactions_df, products_df, user_col, item_col, rating_col
+        )
     
     def get_bpr_sampling_strategy(self):
         """
@@ -638,114 +894,6 @@ class DataProcessor:
         """
         return self.id_mapper.reverse_item_mapping(i_indices)
     
-    def create_id_mappings(
-        self,
-        interactions_df: pd.DataFrame,
-        user_col: str = 'user_id',
-        item_col: str = 'product_id'
-    ):
-        """
-        Create bidirectional ID mappings (Step 3).
-        
-        Args:
-            interactions_df: DataFrame with user and item IDs
-            user_col: User ID column
-            item_col: Item ID column
-        
-        Returns:
-            Tuple of (user_to_idx, idx_to_user, item_to_idx, idx_to_item)
-        
-        Example:
-            >>> u2i, i2u, i2i, i2i = processor.create_id_mappings(df)
-            >>> print(f"Mapped {len(u2i)} users, {len(i2i)} items")
-        """
-        return self.id_mapper.create_mappings(interactions_df, user_col, item_col)
-    
-    def apply_id_mappings(
-        self,
-        interactions_df: pd.DataFrame,
-        user_col: str = 'user_id',
-        item_col: str = 'product_id'
-    ):
-        """
-        Apply ID mappings to interactions DataFrame (Step 3).
-        
-        Args:
-            interactions_df: DataFrame with user_id and product_id
-            user_col: User ID column
-            item_col: Item ID column
-        
-        Returns:
-            DataFrame with added u_idx and i_idx columns
-        
-        Example:
-            >>> df_mapped = processor.apply_id_mappings(df)
-            >>> print(df_mapped[['user_id', 'u_idx', 'product_id', 'i_idx']].head())
-        """
-        return self.id_mapper.apply_mappings(interactions_df, user_col, item_col)
-    
-    def save_id_mappings(
-        self,
-        output_path: str,
-        interactions_df: pd.DataFrame
-    ):
-        """
-        Save ID mappings to JSON file (Step 3).
-        
-        Args:
-            output_path: Path to save JSON file
-            interactions_df: Original interactions DataFrame for hash
-        
-        Example:
-            >>> processor.save_id_mappings('data/processed/user_item_mappings.json', df)
-        """
-        self.id_mapper.save_mappings(output_path, interactions_df)
-    
-    def load_id_mappings(self, input_path: str):
-        """
-        Load ID mappings from JSON file (Step 3).
-        
-        Args:
-            input_path: Path to JSON file
-        
-        Example:
-            >>> processor.load_id_mappings('data/processed/user_item_mappings.json')
-        """
-        self.id_mapper.load_mappings(input_path)
-    
-    def get_mapping_stats(self):
-        """
-        Get statistics about current ID mappings.
-        
-        Returns:
-            Dict with mapping statistics
-        """
-        return self.id_mapper.get_mapping_stats()
-    
-    def reverse_user_mapping(self, u_indices):
-        """
-        Convert contiguous indices back to original user IDs.
-        
-        Args:
-            u_indices: Array-like of u_idx values
-        
-        Returns:
-            List of original user_ids
-        """
-        return self.id_mapper.reverse_user_mapping(u_indices)
-    
-    def reverse_item_mapping(self, i_indices):
-        """
-        Convert contiguous indices back to original item IDs.
-        
-        Args:
-            i_indices: Array-like of i_idx values
-        
-        Returns:
-            List of original product_ids
-        """
-        return self.id_mapper.reverse_item_mapping(i_indices)
-    
     # ========================================================================
     # Step 4: Temporal Split Methods
     # ========================================================================
@@ -757,7 +905,8 @@ class DataProcessor:
         use_validation: bool = False,
         timestamp_col: str = 'cmt_date',
         user_col: str = 'u_idx',
-        rating_col: str = 'rating'
+        rating_col: str = 'rating',
+        item_col: str = 'i_idx'
     ):
         """
         Split interactions into train/test(/val) sets with temporal ordering (Step 4).
@@ -769,6 +918,7 @@ class DataProcessor:
             timestamp_col: Name of timestamp column
             user_col: Name of user column
             rating_col: Name of rating column
+            item_col: Name of item/product index column
             
         Returns:
             Tuple of (train_df, test_df, val_df)
@@ -790,7 +940,8 @@ class DataProcessor:
             use_validation=use_validation,
             timestamp_col=timestamp_col,
             user_col=user_col,
-            rating_col=rating_col
+            rating_col=rating_col,
+            item_col=item_col
         )
     
     def get_split_metadata(self):

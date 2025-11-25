@@ -12,7 +12,7 @@ Key Features:
 """
 
 import logging
-from typing import Dict, List, Set, Tuple, Optional
+from typing import Dict, List, Set, Tuple, Optional, Any
 
 import pandas as pd
 import numpy as np
@@ -504,3 +504,243 @@ class BPRDataPreparer:
         
         logger.info("✓ BPR labels validation passed")
         return True
+    
+    # ========================================================================
+    # Step 1: BPR Positive Pairs Methods (for Training)
+    # ========================================================================
+    
+    def build_positive_pairs(
+        self,
+        interactions_df: pd.DataFrame,
+        user_col: str = 'u_idx',
+        item_col: str = 'i_idx'
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """
+        Build positive pairs list from DataFrame for BPR training (Step 1.2).
+        
+        Args:
+            interactions_df: DataFrame with 'is_positive' column (must have 0/1)
+            user_col: User index column
+            item_col: Item index column
+        
+        Returns:
+            Tuple[np.ndarray, Dict]:
+                - Array of shape (N, 2) with columns [u_idx, i_idx]
+                - Statistics dictionary
+        
+        Usage:
+            Positive pairs are used in BPR training:
+            1. For each (u, i_pos) pair, sample a negative i_neg
+            2. Compute BPR loss: -log(sigmoid(score(u, i_pos) - score(u, i_neg)))
+        
+        Example:
+            >>> preparer = BPRDataPreparer(positive_threshold=4.0)
+            >>> pairs, stats = preparer.build_positive_pairs(train_df)
+            >>> print(f"Total positive pairs: {len(pairs):,}")
+            >>> print(f"First 5 pairs: {pairs[:5]}")
+        """
+        logger.info("\n" + "="*80)
+        logger.info("STEP 1.2: BUILD BPR POSITIVE PAIRS")
+        logger.info("="*80)
+        
+        # Check for is_positive column
+        if 'is_positive' not in interactions_df.columns:
+            logger.info("Creating is_positive column...")
+            if 'rating' in interactions_df.columns:
+                interactions_df = self.create_positive_labels(interactions_df)
+            else:
+                raise ValueError(
+                    "DataFrame must have 'is_positive' column or 'rating' column "
+                    "to compute positive labels"
+                )
+        
+        # Filter to positive interactions
+        positive_df = interactions_df[interactions_df['is_positive'] == 1]
+        
+        # Extract pairs
+        users = positive_df[user_col].values
+        items = positive_df[item_col].values
+        
+        pairs = np.column_stack([users, items])
+        
+        # Compute statistics
+        num_pairs = len(pairs)
+        num_unique_users = len(np.unique(users))
+        num_unique_items = len(np.unique(items))
+        avg_pairs_per_user = num_pairs / num_unique_users if num_unique_users > 0 else 0
+        
+        stats = {
+            'num_pairs': num_pairs,
+            'num_unique_users': num_unique_users,
+            'num_unique_items': num_unique_items,
+            'avg_pairs_per_user': avg_pairs_per_user,
+            'positive_threshold': self.positive_threshold,
+            'pair_shape': pairs.shape
+        }
+        
+        logger.info(f"Positive pairs:       {num_pairs:,}")
+        logger.info(f"Unique users:         {num_unique_users:,}")
+        logger.info(f"Unique items:         {num_unique_items:,}")
+        logger.info(f"Avg pairs per user:   {avg_pairs_per_user:.2f}")
+        logger.info("✓ Positive pairs built")
+        
+        return pairs, stats
+    
+    def build_positive_pairs_from_sets(
+        self,
+        user_pos_sets: Dict[int, Set[int]]
+    ) -> Tuple[np.ndarray, Dict[str, Any]]:
+        """
+        Build positive pairs list from user positive sets (Step 1.2 alternative).
+        
+        This method creates the same output as build_positive_pairs() but uses
+        precomputed user_pos_sets instead of scanning DataFrame.
+        
+        Args:
+            user_pos_sets: Dict mapping u_idx -> Set of positive i_idx
+                          (from build_positive_sets())
+        
+        Returns:
+            Tuple[np.ndarray, Dict]:
+                - Array of shape (N, 2) with columns [u_idx, i_idx]
+                - Statistics dictionary
+        
+        Example:
+            >>> user_pos_sets = preparer.build_positive_sets(train_df)
+            >>> pairs, stats = preparer.build_positive_pairs_from_sets(user_pos_sets)
+        """
+        logger.info("\n" + "="*80)
+        logger.info("STEP 1.2: BUILD BPR POSITIVE PAIRS (FROM SETS)")
+        logger.info("="*80)
+        
+        # Expand user-item pairs
+        all_pairs = []
+        for user_idx, item_set in user_pos_sets.items():
+            for item_idx in item_set:
+                all_pairs.append([user_idx, item_idx])
+        
+        pairs = np.array(all_pairs, dtype=np.int64)
+        
+        # Compute statistics
+        num_pairs = len(pairs)
+        num_unique_users = len(user_pos_sets)
+        all_items = set()
+        for items in user_pos_sets.values():
+            all_items.update(items)
+        num_unique_items = len(all_items)
+        avg_pairs_per_user = num_pairs / num_unique_users if num_unique_users > 0 else 0
+        
+        stats = {
+            'num_pairs': num_pairs,
+            'num_unique_users': num_unique_users,
+            'num_unique_items': num_unique_items,
+            'avg_pairs_per_user': avg_pairs_per_user,
+            'pair_shape': pairs.shape
+        }
+        
+        logger.info(f"Positive pairs:       {num_pairs:,}")
+        logger.info(f"Unique users:         {num_unique_users:,}")
+        logger.info(f"Unique items:         {num_unique_items:,}")
+        logger.info(f"Avg pairs per user:   {avg_pairs_per_user:.2f}")
+        logger.info("✓ Positive pairs built from sets")
+        
+        return pairs, stats
+    
+    def get_bpr_training_data(
+        self,
+        interactions_df: pd.DataFrame,
+        products_df: Optional[pd.DataFrame] = None,
+        user_col: str = 'u_idx',
+        item_col: str = 'i_idx',
+        rating_col: str = 'rating'
+    ) -> Dict[str, Any]:
+        """
+        Get complete BPR training data (Step 1 complete).
+        
+        This method orchestrates the full data preparation pipeline:
+        1. Create positive labels (is_positive column)
+        2. Build positive sets (user -> set of positive items)
+        3. Build positive pairs (array of [u, i] for training)
+        4. Mine hard negatives (explicit + implicit)
+        5. Return comprehensive training data
+        
+        Args:
+            interactions_df: DataFrame with user-item interactions
+            products_df: Optional product metadata for implicit negative mining
+            user_col: User index column
+            item_col: Item index column
+            rating_col: Rating column
+        
+        Returns:
+            Dict containing:
+                - 'positive_pairs': np.ndarray of shape (N, 2)
+                - 'user_pos_sets': Dict[u_idx, Set[i_idx]]
+                - 'hard_neg_sets': Dict[u_idx, Set[i_idx]]
+                - 'num_users': Total number of users
+                - 'num_items': Total number of items
+                - 'stats': Comprehensive statistics
+        
+        Example:
+            >>> data = preparer.get_bpr_training_data(train_df, products_df)
+            >>> print(f"Positive pairs: {len(data['positive_pairs']):,}")
+            >>> print(f"Users with hard negatives: {len(data['hard_neg_sets']):,}")
+        """
+        logger.info("\n" + "="*80)
+        logger.info("BPR DATA PREPARATION - COMPLETE PIPELINE")
+        logger.info("="*80)
+        
+        # Step 1: Create positive labels
+        df_labeled = self.create_positive_labels(interactions_df.copy(), rating_col)
+        
+        # Step 2: Build positive sets
+        user_pos_sets = self.build_positive_sets(
+            df_labeled, user_col, item_col
+        )
+        
+        # Step 3: Build positive pairs
+        positive_pairs, pairs_stats = self.build_positive_pairs(
+            df_labeled, user_col, item_col
+        )
+        
+        # Step 4: Mine hard negatives
+        _, hard_neg_sets = self.mine_hard_negatives(
+            df_labeled, products_df, rating_col, user_col, item_col
+        )
+        
+        # Compute comprehensive statistics
+        num_users = df_labeled[user_col].nunique()
+        num_items = df_labeled[item_col].nunique()
+        
+        stats = {
+            'num_users': num_users,
+            'num_items': num_items,
+            'num_positive_pairs': len(positive_pairs),
+            'num_users_with_positives': len(user_pos_sets),
+            'num_users_with_hard_negatives': len(hard_neg_sets),
+            'avg_positives_per_user': pairs_stats['avg_pairs_per_user'],
+            'avg_hard_negatives_per_user': (
+                sum(len(s) for s in hard_neg_sets.values()) / len(hard_neg_sets)
+                if hard_neg_sets else 0
+            ),
+            'positive_threshold': self.positive_threshold,
+            'hard_negative_threshold': self.hard_negative_threshold,
+            'hard_negative_ratio': self.hard_negative_ratio,
+            'top_k_popular': self.top_k_popular
+        }
+        
+        logger.info("\n" + "-"*80)
+        logger.info("BPR DATA PREPARATION COMPLETE")
+        logger.info("-"*80)
+        logger.info(f"Users: {num_users:,}, Items: {num_items:,}")
+        logger.info(f"Positive pairs: {len(positive_pairs):,}")
+        logger.info(f"Users with hard negatives: {len(hard_neg_sets):,}")
+        logger.info("-"*80)
+        
+        return {
+            'positive_pairs': positive_pairs,
+            'user_pos_sets': user_pos_sets,
+            'hard_neg_sets': hard_neg_sets,
+            'num_users': num_users,
+            'num_items': num_items,
+            'stats': stats
+        }

@@ -1,0 +1,16 @@
+2025-11-25 17:31:31,705 - health_check - INFO - Checking service...
+2025-11-25 17:31:35,762 - health_check - INFO -   ✗ api_reachable: Service is not running
+2025-11-25 17:31:35,762 - health_check - INFO - Checking data...
+2025-11-25 17:31:35,762 - health_check - INFO -   ✓ files_exist: All required files present
+2025-11-25 17:31:35,762 - health_check - INFO -   ✓ data_freshness: Data age: 0 days (threshold: 7)
+2025-11-25 17:31:35,762 - health_check - INFO -   ✗ data_integrity: Users: 0, Items: 0, Interactions: 0
+2025-11-25 17:31:35,762 - health_check - INFO -   ✓ embeddings_exist: PhoBERT embeddings available
+2025-11-25 17:31:35,762 - health_check - INFO - Checking models...
+2025-11-25 17:31:35,762 - health_check - INFO -   ✓ registry_exists: Registry file exists
+2025-11-25 17:31:35,762 - health_check - INFO -   ✓ registry_valid: Registry is valid JSON
+2025-11-25 17:31:35,762 - health_check - INFO -   ✓ current_best: Current best: bert_als_20251125_061805
+2025-11-25 17:31:35,762 - health_check - INFO -   ✓ model_files: Model files exist
+2025-11-25 17:31:35,762 - health_check - INFO -   ✓ model_performance: Recall@10: 0.1280 (threshold: 0.1)
+2025-11-25 17:31:35,768 - health_check - INFO - Checking pipelines...
+2025-11-25 17:31:35,768 - health_check - INFO -   ✓ cleanup_status: cleanup: 50% success rate
+2025-11-25 17:31:35,768 - health_check - INFO -   ✓ model_deployment_status: model_deployment: 50% success rate

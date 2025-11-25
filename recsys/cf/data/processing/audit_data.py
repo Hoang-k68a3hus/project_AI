@@ -197,6 +197,7 @@ class DataAuditor:
         """
         initial_len = len(df)
         df[column] = pd.to_numeric(df[column], errors='coerce')
+        df = df[df[column].notna()]
         dropped = initial_len - len(df)
         return df, dropped
     

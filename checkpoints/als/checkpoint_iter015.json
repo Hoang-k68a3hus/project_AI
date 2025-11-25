@@ -1,0 +1,17 @@
+{
+  "iteration": 15,
+  "timestamp": 1763993924.4836009,
+  "user_factors_shape": [
+    1423,
+    64
+  ],
+  "item_factors_shape": [
+    26050,
+    64
+  ],
+  "model_config": {
+    "factors": 64,
+    "regularization": 0.1,
+    "alpha": 10
+  }
+}

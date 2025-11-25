@@ -1,0 +1,21 @@
+2025-11-25 15:47:16 | INFO | Training started | run_id=integration_test_20251125_154716
+2025-11-25 15:47:16 | INFO | Iteration 1/5 | loss=1.0000
+2025-11-25 15:47:16 | INFO | Iteration 2/5 | loss=0.5000
+2025-11-25 15:47:16 | INFO | Iteration 3/5 | loss=0.3333
+2025-11-25 15:47:16 | INFO | Iteration 4/5 | loss=0.2500
+2025-11-25 15:47:16 | INFO | Iteration 5/5 | loss=0.2000
+2025-11-25 15:47:16 | INFO | Training completed
+2025-11-25 15:47:26 | INFO | Training started | run_id=integration_test_20251125_154726
+2025-11-25 15:47:26 | INFO | Iteration 1/5 | loss=1.0000
+2025-11-25 15:47:26 | INFO | Iteration 2/5 | loss=0.5000
+2025-11-25 15:47:26 | INFO | Iteration 3/5 | loss=0.3333
+2025-11-25 15:47:26 | INFO | Iteration 4/5 | loss=0.2500
+2025-11-25 15:47:26 | INFO | Iteration 5/5 | loss=0.2000
+2025-11-25 15:47:26 | INFO | Training completed
+2025-11-25 17:30:39 | INFO | Training started | run_id=integration_test_20251125_173039
+2025-11-25 17:30:39 | INFO | Iteration 1/5 | loss=1.0000
+2025-11-25 17:30:39 | INFO | Iteration 2/5 | loss=0.5000
+2025-11-25 17:30:39 | INFO | Iteration 3/5 | loss=0.3333
+2025-11-25 17:30:39 | INFO | Iteration 4/5 | loss=0.2500
+2025-11-25 17:30:39 | INFO | Iteration 5/5 | loss=0.2000
+2025-11-25 17:30:39 | INFO | Training completed

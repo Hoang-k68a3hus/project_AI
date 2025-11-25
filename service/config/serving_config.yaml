@@ -138,3 +138,4 @@ paths:
   trainable_user_mapping: "data/processed/trainable_user_mapping.json"
   item_metadata: "data/processed/item_metadata.pkl"
   phobert_embeddings: "data/processed/content_based_embeddings/product_embeddings.pt"
+  phobert_embeddings_published: "data/published_data/content_based_embeddings/phobert_description_feature.pt"

@@ -1,0 +1,143 @@
+# Serving Configuration for CF Recommendation Service
+# Optimized for latency <200ms with ~91% cold-start traffic
+
+# ============================================================================
+# Cache Configuration
+# ============================================================================
+cache:
+  # User BERT profile cache (for cold-start content recommendations)
+  user_profile:
+    max_size: 50000        # ~50K users can be cached
+    ttl_seconds: 3600      # 1 hour TTL
+    
+  # Item-item similarity cache
+  item_similarity:
+    max_size: 5000         # Top 5K items cached
+    ttl_seconds: 86400     # 24 hours TTL
+    
+  # Fallback recommendation cache
+  fallback:
+    max_size: 10000        # ~10K unique request patterns
+    ttl_seconds: 1800      # 30 min TTL (freshness vs performance)
+
+# ============================================================================
+# Warm-up Configuration
+# CRITICAL: Pre-warm before accepting traffic
+# ============================================================================
+warmup:
+  enabled: true
+  
+  # Popular items to pre-load
+  num_popular_items: 200
+  
+  # Pre-compute similarities for popular items
+  precompute_similarities: true
+  
+  # Number of user profiles to pre-warm (optional)
+  num_user_profiles: 1000
+  
+  # Run warmup on startup
+  warmup_on_startup: true
+
+# ============================================================================
+# Reranking Configuration
+# ============================================================================
+reranking:
+  enabled: true
+  
+  # Weights for trainable users (CF available)
+  weights_trainable:
+    cf: 0.30              # CF signal (collaborative)
+    content: 0.40         # PhoBERT semantic similarity
+    popularity: 0.20      # Trending items
+    quality: 0.10         # High-rated products
+  
+  # Weights for cold-start users (no CF data)
+  weights_cold_start:
+    content: 0.60         # DOMINANT signal
+    popularity: 0.30      # Social proof
+    quality: 0.10         # Bonus
+  
+  # Diversity settings
+  diversity:
+    enabled: true
+    penalty: 0.1          # Penalty for similar items
+    threshold: 0.85       # BERT similarity threshold
+  
+  # Candidate expansion
+  candidate_multiplier: 5  # Generate 5x candidates for reranking
+
+# ============================================================================
+# PhoBERT Configuration
+# ============================================================================
+phobert:
+  embeddings_path: "data/processed/content_based_embeddings/product_embeddings.pt"
+  
+  # Pre-compute full similarity matrix (only for small catalogs <3K items)
+  precompute_similarity_matrix: true
+  max_items_for_precompute: 3000
+  
+  # User profile aggregation strategy
+  user_profile_strategy: "weighted_mean"  # mean, weighted_mean, max
+
+# ============================================================================
+# Performance Targets
+# ============================================================================
+targets:
+  # Latency targets (milliseconds)
+  latency:
+    p50_ms: 50            # Median latency target
+    p90_ms: 100           # 90th percentile
+    p95_ms: 150           # 95th percentile
+    p99_ms: 200           # 99th percentile (SLA)
+    max_ms: 500           # Absolute max before timeout
+  
+  # Cache targets
+  cache:
+    hit_rate_target: 0.70  # 70% hit rate goal
+    warmup_required: true
+  
+  # Throughput
+  throughput:
+    min_rps: 100          # Minimum requests per second
+    target_rps: 500       # Target RPS
+
+# ============================================================================
+# Fallback Configuration
+# ============================================================================
+fallback:
+  # Default strategy for cold-start users
+  default_strategy: "hybrid"  # popularity, item_similarity, hybrid
+  
+  # Content weight in hybrid
+  content_weight: 0.7
+  popularity_weight: 0.3
+  
+  # Enable caching for fallback results
+  enable_cache: true
+
+# ============================================================================
+# Model Hot-Reload
+# ============================================================================
+hot_reload:
+  enabled: true
+  check_interval_seconds: 60  # Check registry every minute
+  
+  # On model update actions
+  on_update:
+    clear_item_similarity_cache: true
+    clear_user_profile_cache: false  # Keep user profiles (still valid)
+    re_warmup: true
+
+# ============================================================================
+# Logging
+# ============================================================================
+logging:
+  level: "INFO"
+  
+  # Log slow requests
+  slow_request_threshold_ms: 200
+  
+  # Metrics logging
+  log_request_metrics: true
+  metrics_aggregation_interval_seconds: 60
