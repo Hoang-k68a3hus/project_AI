@@ -15,6 +15,13 @@ ENV/
 .idea/
 *.swp
 *.swo
+.cursor/
+
+# Local temp uploads / exports
+.tmp.driveupload/
+
+# GitHub metadata not needed in repo
+.github/
 
 # Processed data (large files)
 data/processed/*.parquet
