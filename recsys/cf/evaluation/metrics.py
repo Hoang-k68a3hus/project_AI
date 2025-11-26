@@ -430,7 +430,12 @@ class MAPAtK(BaseMetric):
         if num_relevant_in_k == 0:
             return 0.0
         
-        return sum_precision / min(len(ground_truth), k)
+        # Avoid division by zero
+        denominator = min(len(ground_truth), k)
+        if denominator == 0:
+            return 0.0
+        
+        return sum_precision / denominator
 
 
 class HitRate(BaseMetric):

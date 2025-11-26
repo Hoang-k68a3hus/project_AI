@@ -44,15 +44,47 @@ Check user_metadata
 ```
 service/
 ├── recommender/
-│   ├── __init__.py
-│   ├── loader.py           # Load models từ registry
-│   ├── recommender.py      # Core recommendation logic
-│   ├── rerank.py          # Hybrid reranking (optional)
-│   ├── filters.py         # Attribute filtering
-│   └── fallback.py        # Cold-start handling
-├── api.py                 # REST API (FastAPI)
+│   ├── __init__.py          # Package exports
+│   ├── loader.py            # CFModelLoader (singleton)
+│   ├── recommender.py       # CFRecommender (main engine)
+│   ├── fallback.py          # FallbackRecommender (cold-start)
+│   ├── phobert_loader.py    # PhoBERTEmbeddingLoader (singleton)
+│   ├── rerank.py            # HybridReranker (hybrid reranking)
+│   ├── filters.py           # Attribute filtering & boosting
+│   └── cache.py             # CacheManager (LRU caching & warm-up)
+├── search/                  # Smart Search (Task 09)
+│   ├── query_encoder.py
+│   ├── search_index.py
+│   └── smart_search.py
+├── api.py                   # FastAPI REST API
+├── dashboard.py             # Monitoring dashboard
 └── config/
-    └── serving_config.yaml
+    ├── serving_config.yaml
+    ├── rerank_config.yaml
+    └── search_config.yaml
+```
+
+### Package Exports
+
+```python
+from service.recommender import (
+    # Loaders
+    CFModelLoader, get_loader,
+    PhoBERTEmbeddingLoader, get_phobert_loader,
+    
+    # Core
+    CFRecommender, RecommendationResult,
+    FallbackRecommender,
+    
+    # Hybrid Reranking
+    HybridReranker, get_reranker, RerankedResult,
+    
+    # Filtering
+    apply_filters, boost_by_attributes,
+    
+    # Caching
+    CacheManager, get_cache_manager
+)
 ```
 
 ## Component 1: Model Loader
@@ -62,146 +94,155 @@ service/
 #### Class: `CFModelLoader`
 
 ##### Purpose
-Singleton class quản lý model loading, caching, và hot-reload khi registry updates.
+Singleton class for loading CF models, mappings, metadata, and trainable user routing information. Handles hot-reload when registry updates.
+
+##### Initialization
+
+```python
+from service.recommender.loader import CFModelLoader, get_loader
+
+# Option 1: Direct instantiation (singleton pattern)
+loader = CFModelLoader(
+    registry_path='artifacts/cf/registry.json',
+    data_dir='data/processed',
+    published_dir='data/published_data',
+    auto_load=False  # Set True to auto-load on init
+)
+
+# Option 2: Singleton getter (recommended)
+loader = get_loader()  # Returns singleton instance
+```
 
 ##### Attributes
+
 ```python
 class CFModelLoader:
-    def __init__(self, registry_path='artifacts/cf/registry.json'):
-        self.registry_path = registry_path
-        self.current_model = None  # Cached model
-        self.current_model_id = None
-        self.mappings = None  # User/item mappings
-        self.item_metadata = None  # Product info
+    # Cached state
+    current_model: Optional[Dict[str, Any]]  # Loaded model dict
+    current_model_id: Optional[str]
+    mappings: Optional[Dict[str, Any]]  # User/item ID mappings
+    trainable_user_mapping: Optional[Dict[int, int]]  # u_idx -> u_idx_cf
+    trainable_user_set: Optional[Set[int]]  # Set of trainable u_idx
+    item_metadata: Optional[pd.DataFrame]  # Product metadata
+    user_history_cache: Optional[Dict[int, Set[int]]]  # user_id -> {product_ids}
+    top_k_popular_items: Optional[List[int]]  # Pre-computed popular items
+    data_stats: Optional[Dict[str, Any]]  # Data statistics
 ```
 
 ##### Method 1: `load_model(model_id=None)`
+
 ```python
-def load_model(self, model_id=None):
-    """
-    Load CF model từ registry.
-    
-    Args:
-        model_id: Optional model ID. Nếu None → load current_best
-    
-    Returns:
-        dict: {
-            'model_id': str,
-            'model_type': 'als' | 'bpr',
-            'U': np.array (num_users, factors),
-            'V': np.array (num_items, factors),
-            'params': dict,
-            'metadata': dict
-        }
-    
-    Raises:
-        FileNotFoundError: Model artifacts không tồn tại
-        ValueError: Invalid model_id
-    """
-    # Load registry
-    registry = load_registry_json(self.registry_path)
-    
-    # Determine model to load
-    if model_id is None:
-        model_id = registry['current_best']['model_id']
-    
-    # Get model info
-    model_info = registry['models'][model_id]
-    model_path = model_info['path']
-    
-    # Load embeddings
-    U = np.load(f"{model_path}/{model_info['model_type']}_U.npy")
-    V = np.load(f"{model_path}/{model_info['model_type']}_V.npy")
-    
-    # Load params
-    # (đảm bảo module đã import os)
-    param_pattern = os.path.join(model_path, f"{model_info['model_type']}_params.json")
-    with open(param_pattern) as f:
-        params = json.load(f)
-    
-    # Cache
-    self.current_model = {
-        'model_id': model_id,
-        'model_type': model_info['model_type'],
-        'U': U,
-        'V': V,
-        'params': params,
-        'metadata': model_info
-    }
-    self.current_model_id = model_id
-    
-    return self.current_model
+model = loader.load_model(model_id=None)
+
+# Returns:
+# {
+#     'model_id': 'als_v2_20250116_141500',
+#     'model_type': 'als',
+#     'U': np.ndarray (num_trainable_users, factors),
+#     'V': np.ndarray (num_items, factors),
+#     'params': dict,
+#     'metadata': dict,
+#     'score_range': {'min': 0.0, 'max': 1.5, 'p01': ..., 'p99': ...},
+#     'loaded_at': '2025-01-16T14:30:00'
+# }
+
+# Features:
+# - Auto-detects current_best if model_id=None
+# - Handles U/V matrix swap detection (from Colab training)
+# - Loads score_range for normalization
+# - Caches model in memory
 ```
 
 ##### Method 2: `load_mappings(data_version=None)`
+
 ```python
-def load_mappings(self, data_version=None):
-    """
-    Load user/item ID mappings.
-    
-    Args:
-        data_version: Optional hash. Nếu None → load latest
-    
-    Returns:
-        dict: {
-            'user_to_idx': {user_id: u_idx},
-            'idx_to_user': {u_idx: user_id},
-            'item_to_idx': {product_id: i_idx},
-            'idx_to_item': {i_idx: product_id},
-            'metadata': {...}
-        }
-    """
-    path = 'data/processed/user_item_mappings.json'
-    
-    with open(path) as f:
-        mappings = json.load(f)
-    
-    # Validate data version nếu có
-    if data_version and mappings['metadata']['data_hash'] != data_version:
-        warnings.warn(f"Data version mismatch: {data_version} vs {mappings['metadata']['data_hash']}")
-    
-    self.mappings = mappings
-    return mappings
+mappings = loader.load_mappings(data_version=None)
+
+# Returns:
+# {
+#     'user_to_idx': {user_id: u_idx},
+#     'idx_to_user': {u_idx: user_id},
+#     'item_to_idx': {product_id: i_idx},
+#     'idx_to_item': {i_idx: product_id},
+#     'metadata': {
+#         'num_users': 300000,
+#         'num_items': 2244,
+#         'num_trainable_users': 26000,
+#         'data_hash': 'abc123...'
+#     }
+# }
+
+# Also automatically loads:
+# - trainable_user_mapping (u_idx -> u_idx_cf)
+# - top_k_popular_items
+# - data_stats
 ```
 
 ##### Method 3: `load_item_metadata()`
+
 ```python
-def load_item_metadata(self):
-    """
-    Load product metadata cho enrichment.
-    
-    Returns:
-        pd.DataFrame: Products với columns [product_id, product_name, brand, ...]
-    """
-    products = pd.read_csv('data/published_data/data_product.csv', encoding='utf-8')
-    attributes = pd.read_csv('data/published_data/data_product_attribute.csv', encoding='utf-8')
-    
-    # Merge
-    metadata = products.merge(attributes, on='product_id', how='left')
-    
-    # Cache
-    self.item_metadata = metadata
-    return metadata
+metadata = loader.load_item_metadata()
+
+# Returns: pd.DataFrame with product info
+# Tries enriched_products.parquet first, falls back to raw CSVs
+# Columns: product_id, product_name, brand, price, avg_star, num_sold_time, ...
 ```
 
-##### Method 4: `reload_if_updated()`
+##### Method 4: `load_user_histories()`
+
 ```python
-def reload_if_updated(self):
-    """
-    Check registry for updates và reload nếu current_best changed.
-    
-    Returns:
-        bool: True nếu reloaded, False otherwise
-    """
-    registry = load_registry_json(self.registry_path)
-    new_best_id = registry['current_best']['model_id']
-    
-    if new_best_id != self.current_model_id:
-        logger.info(f"Registry updated: {self.current_model_id} → {new_best_id}")
-        self.load_model(new_best_id)
-        return True
-    
-    return False
+histories = loader.load_user_histories()
+
+# Returns: Dict[int, Set[int]] - {user_id: {product_ids}}
+# IMPORTANT: Only loads TRAIN split to avoid data leakage
+# Cached in memory for fast seen-item filtering
+```
+
+##### Method 5: `is_trainable_user(user_id)`
+
+```python
+is_trainable = loader.is_trainable_user(user_id=12345)
+
+# Returns: bool
+# True if user has ≥2 interactions AND ≥1 positive rating
+# Used for routing: CF vs content-based
+```
+
+##### Method 6: `get_cf_user_index(user_id)`
+
+```python
+u_idx_cf = loader.get_cf_user_index(user_id=12345)
+
+# Returns: int or None
+# CF matrix row index (u_idx_cf) for trainable users
+# None if user is not trainable
+```
+
+##### Method 7: `get_user_history(user_id)`
+
+```python
+history = loader.get_user_history(user_id=12345)
+
+# Returns: Set[int] - Set of product_ids user has interacted with
+# Uses cached user_history_cache (train split only)
+```
+
+##### Method 8: `reload_if_updated()`
+
+```python
+reloaded = loader.reload_if_updated()
+
+# Returns: bool - True if model was reloaded
+# Checks registry for new current_best and reloads if changed
+```
+
+##### Method 9: `get_popular_items(topk=50)`
+
+```python
+popular_indices = loader.get_popular_items(topk=50)
+
+# Returns: List[int] - Top-K popular item indices
+# Uses pre-computed top_k_popular_items from data processing
 ```
 
 ## Component 2: Core Recommender
@@ -211,116 +252,130 @@ def reload_if_updated(self):
 #### Class: `CFRecommender`
 
 ##### Purpose
-Main recommendation engine với scoring, filtering, ranking logic.
+Main recommendation engine with user segmentation routing, CF scoring, hybrid reranking, and fallback handling.
 
 ##### Initialization
+
 ```python
-class CFRecommender:
-    def __init__(self, model_loader: CFModelLoader):
-        self.loader = model_loader
-        
-        # Load artifacts
-        self.model = model_loader.load_model()
-        self.mappings = model_loader.load_mappings(
-            data_version=self.model['metadata'].get('data_version')
-        )
-        self.item_metadata = model_loader.load_item_metadata()
-        
-        # Precompute
-        self.U = self.model['U']
-        self.V = self.model['V']
-        self.num_items = self.V.shape[0]
-        self.user_history_cache = self._load_user_histories()
+from service.recommender import CFRecommender
+
+recommender = CFRecommender(
+    loader=None,  # Uses get_loader() singleton if None
+    phobert_loader=None,  # Lazy-loaded if None
+    auto_load=True,  # Auto-load models and data on init
+    enable_reranking=True,  # Enable hybrid reranking by default
+    rerank_config_path=None  # Path to rerank config YAML
+)
 ```
 
-##### Helper: `_load_user_histories()`
+##### Data Class: `RecommendationResult`
+
 ```python
-def _load_user_histories(self):
-    """
-    Preload user → product interactions once để phục vụ low-latency.
-    """
-    interactions = pd.read_parquet(
-        'data/processed/interactions.parquet',
-        columns=['user_id', 'product_id']
-    )
-    history = (
-        interactions.groupby('user_id')['product_id']
-        .apply(lambda s: set(s.tolist()))
-        .to_dict()
-    )
-    return history
+@dataclass
+class RecommendationResult:
+    user_id: int
+    recommendations: List[Dict[str, Any]]  # Enriched recommendations
+    count: int
+    is_fallback: bool  # True if used fallback (cold-start)
+    fallback_method: Optional[str]  # 'popularity', 'item_similarity', 'hybrid'
+    latency_ms: float
+    model_id: Optional[str]  # CF model ID (None for fallback)
 ```
 
-##### Method 1: `recommend(user_id, topk=10, exclude_seen=True, filter_params=None)`
+##### Method 1: `recommend()`
+
 ```python
-def recommend(self, user_id, topk=10, exclude_seen=True, filter_params=None):
-    """
-    Generate top-K recommendations cho user.
-    
-    Args:
-        user_id: Original user ID (int)
-        topk: Number of recommendations (default 10)
-        exclude_seen: Nếu True, loại bỏ items user đã tương tác
-        filter_params: Dict với attribute filters (e.g., {'brand': 'Innisfree'})
-    
-    Returns:
-        list of dict: [
-            {
-                'product_id': int,
-                'score': float,
-                'product_name': str,
-                'brand': str,
-                'price': float,
-                ...
-            },
-            ...
-        ]
-    
-    Raises:
-        KeyError: User ID không tồn tại (cold-start)
-    """
-    # Check user exists
-    if user_id not in self.mappings['user_to_idx']:
-        # Cold-start fallback
-        return self._fallback_recommendations(topk, filter_params)
-    
-    # Map user_id → u_idx
-    u_idx = self.mappings['user_to_idx'][user_id]
-    
-    # Compute scores
-    scores = self.U[u_idx] @ self.V.T  # Shape: (num_items,)
-    
-    # Exclude seen items
-    if exclude_seen:
-        seen_items = self._get_user_history(user_id)
-        seen_indices = [self.mappings['item_to_idx'][pid] for pid in seen_items if pid in self.mappings['item_to_idx']]
-        scores[seen_indices] = -np.inf
-    
-    # Apply attribute filters
-    if filter_params:
-        valid_indices = self._apply_filters(filter_params)
-        mask = np.ones(self.num_items, dtype=bool)
-        mask[valid_indices] = False
-        scores[mask] = -np.inf
-    
-    # Top-K
-    top_k_indices = np.argsort(scores)[::-1][:topk]
-    
-    # Map i_idx → product_id
-    product_ids = [self.mappings['idx_to_item'][str(i)] for i in top_k_indices]
-    
-    # Enrich với metadata
-    recommendations = []
-    for i, pid in enumerate(product_ids):
-        product_info = self.item_metadata[self.item_metadata['product_id'] == pid].iloc[0].to_dict()
-        recommendations.append({
-            'product_id': pid,
-            'score': float(scores[top_k_indices[i]]),
-            'rank': i + 1,
-            **product_info  # product_name, brand, price, ...
-        })
-    
-    return recommendations
+result = recommender.recommend(
+    user_id=12345,
+    topk=10,
+    exclude_seen=True,
+    filter_params={'brand': 'Innisfree'},  # Optional
+    normalize_scores=False,  # Normalize CF scores to [0, 1]
+    rerank=None  # Override default reranking (None = use default)
+)
+
+# Returns: RecommendationResult
+
+# Workflow:
+# 1. Check if user is trainable (is_trainable_user)
+# 2. If trainable:
+#    - Get CF user index (get_cf_user_index)
+#    - Compute CF scores: U[u_idx_cf] @ V.T
+#    - Exclude seen items
+#    - Apply attribute filters
+#    - Get top-K candidates (5x if reranking)
+#    - Apply hybrid reranking if enabled
+# 3. If cold-start:
+#    - Use FallbackRecommender
+#    - Strategy: 'hybrid' (content + popularity)
+#    - Apply reranking to fallback results
+```
+
+##### Method 2: `batch_recommend()`
+
+```python
+results = recommender.batch_recommend(
+    user_ids=[12345, 67890, 11111],
+    topk=10,
+    exclude_seen=True
+)
+
+# Returns: Dict[int, RecommendationResult]
+# Uses vectorized CF scoring for efficiency
+# Separates trainable vs cold-start users
+# Batch matrix multiplication: U[u_indices] @ V.T
+```
+
+##### Method 3: `similar_items()`
+
+```python
+similar = recommender.similar_items(
+    product_id=123,
+    topk=10,
+    use_cf=True  # If False, uses PhoBERT embeddings
+)
+
+# Returns: List[Dict[str, Any]] - Similar items with metadata
+# If use_cf=True: Uses V @ V.T for CF-based similarity
+# If use_cf=False: Uses PhoBERT embeddings for content similarity
+```
+
+##### Method 4: `reload_model()`
+
+```python
+reloaded = recommender.reload_model()
+
+# Returns: bool - True if model was reloaded
+# Checks registry for updates and reloads if current_best changed
+# Updates U, V, model_id, score_range
+```
+
+##### Method 5: `get_model_info()`
+
+```python
+info = recommender.get_model_info()
+
+# Returns:
+# {
+#     'model_id': 'als_v2_20250116_141500',
+#     'model_type': 'als',
+#     'num_users': 26000,
+#     'num_items': 2244,
+#     'factors': 128,
+#     'trainable_users': 26000,
+#     'reranking_enabled': True,
+#     ...
+# }
+```
+
+##### Properties
+
+```python
+# Lazy-loaded fallback recommender
+fallback = recommender.fallback  # Returns FallbackRecommender instance
+
+# Lazy-loaded hybrid reranker
+reranker = recommender.reranker  # Returns HybridReranker instance
 ```
 
 ##### Method 2: `_get_user_history(user_id)`
@@ -409,469 +464,686 @@ def batch_recommend(self, user_ids, topk=10, exclude_seen=True):
     return results
 ```
 
-## Component 3: Cold-Start Fallback (UPDATED)
+## Component 3: Cold-Start Fallback
 
 ### Module: `service/recommender/fallback.py`
 
-#### Strategy Overview
-For users with 1-2 interactions (cold-start), skip CF and use **Item-Item Similarity + Popularity**.
+#### Class: `FallbackRecommender`
 
-#### Function 1: `_fallback_item_similarity(user_history, topk, filter_params=None)`
+##### Purpose
+Handles cold-start users (~91.4% of traffic) with content-based and popularity-based recommendations. Optimized with LRU caching for low latency.
 
-##### Purpose: Content-Based Recommendations
+##### Initialization
+
 ```python
-def _fallback_item_similarity(self, user_history, topk=10, filter_params=None):
-    """
-    Fallback strategy: Find similar items to user's purchase history using PhoBERT.
-    
-    Args:
-        user_history: List of product_ids user has interacted with
-        topk: Number of recommendations
-        filter_params: Optional attribute filters
-    
-    Returns:
-        list of dict: Content-similar products ranked by relevance
-    """
-    if not user_history:
-        # Truly new user → pure popularity
-        return self._fallback_popularity(topk, filter_params)
-    
-    # Load PhoBERT embeddings
-    if not hasattr(self, '_phobert_loader'):
-        from service.recommender.phobert_loader import PhoBERTEmbeddingLoader
-        self._phobert_loader = PhoBERTEmbeddingLoader()
-    
-    # Get embeddings for user history
-    history_embeddings = []
-    for pid in user_history:
-        emb = self._phobert_loader.get_embedding(pid)
-        if emb is not None:
-            history_embeddings.append(emb)
-    
-    if not history_embeddings:
-        return self._fallback_popularity(topk, filter_params)
-    
-    # Compute user profile (mean of history embeddings)
-    user_profile = np.mean(history_embeddings, axis=0)
-    
-    # Compute similarity to all items
-    all_item_ids = self.item_metadata['product_id'].tolist()
-    similarities = {}
-    
-    for pid in all_item_ids:
-        if pid in user_history:
-            continue  # Skip already purchased
-        
-        item_emb = self._phobert_loader.get_embedding(pid)
-        if item_emb is not None:
-            sim = cosine_similarity(user_profile, item_emb)
-            similarities[pid] = sim
-    
-    # Apply filters
-    if filter_params:
-        filtered_metadata = self.item_metadata.copy()
-        for key, value in filter_params.items():
-            if key in filtered_metadata.columns:
-                filtered_metadata = filtered_metadata[filtered_metadata[key] == value]
-        valid_pids = set(filtered_metadata['product_id'].tolist())
-        similarities = {pid: sim for pid, sim in similarities.items() if pid in valid_pids}
-    
-    # Rank by similarity
-    top_similar = sorted(similarities.items(), key=lambda x: x[1], reverse=True)[:topk]
-    
-    # Format output
-    recommendations = []
-    for rank, (pid, sim_score) in enumerate(top_similar, 1):
-        product_info = self.item_metadata[self.item_metadata['product_id'] == pid].iloc[0]
-        recommendations.append({
-            'product_id': pid,
-            'score': float(sim_score),
-            'rank': rank,
-            'fallback': True,
-            'fallback_method': 'item_similarity',
-            **product_info.to_dict()
-        })
-    
-    return recommendations
+from service.recommender.fallback import FallbackRecommender
 
-
-def cosine_similarity(vec1, vec2):
-    """Compute cosine similarity between two vectors."""
-    return np.dot(vec1, vec2) / (np.linalg.norm(vec1) * np.linalg.norm(vec2))
+fallback = FallbackRecommender(
+    cf_loader=loader,  # CFModelLoader instance
+    phobert_loader=None,  # Lazy-loaded if None
+    default_content_weight=0.7,
+    default_popularity_weight=0.3,
+    enable_cache=True  # Enable LRU caching
+)
 ```
 
-#### Function 2: `_fallback_popularity(topk, filter_params=None)`
+##### Strategy Overview
+For users with <2 interactions (cold-start), skip CF and use:
+1. **Item-Item Similarity** (PhoBERT embeddings)
+2. **Popularity** (Top-selling products)
+3. **Hybrid** (Weighted combination of both)
 
-##### Purpose: Pure Popularity for Truly New Users
+##### Method 1: `recommend()`
+
 ```python
-def _fallback_popularity(self, topk=10, filter_params=None):
-    """
-    Fallback tới popularity ranking cho truly new users (no history).
-    
-    Args:
-        topk: Number of recommendations
-        filter_params: Optional attribute filters
-    
-    Returns:
-        list of dict: Popular products
-    """
-    # Sort by popularity_score (log-transformed from Task 01)
-    popular = self.item_metadata.sort_values('popularity_score', ascending=False)
-    
-    # Apply filters nếu có
-    if filter_params:
-        for key, value in filter_params.items():
-            if key in popular.columns:
-                # Handle standardized lists (e.g., skin_type_standardized)
-                if isinstance(value, list):
-                    popular = popular[popular[key].apply(lambda x: any(v in x for v in value))]
-                else:
-                    popular = popular[popular[key] == value]
-    
-    # Top-K
-    top_popular = popular.head(topk)
-    
-    # Format output
-    recommendations = []
-    for i, row in top_popular.iterrows():
-        recommendations.append({
-            'product_id': row['product_id'],
-            'score': row['popularity_score'],  # Log-transformed popularity
-            'rank': len(recommendations) + 1,
-            'fallback': True,
-            'fallback_method': 'popularity',
-            **row.to_dict()
-        })
-    
-    return recommendations
+recs = fallback.recommend(
+    user_id=12345,  # Optional, to fetch history
+    user_history=[100, 200, 300],  # Overrides user_id lookup
+    topk=10,
+    strategy='hybrid',  # 'popularity', 'item_similarity', or 'hybrid'
+    exclude_ids={400, 500},  # Product IDs to exclude
+    filter_params={'brand': 'Innisfree'}  # Optional filters
+)
+
+# Returns: List[Dict[str, Any]] - Recommendations with metadata
 ```
 
-#### Function 3: `_hybrid_fallback(user_history, topk, content_weight=0.7, popularity_weight=0.3)`
+##### Method 2: `fallback_popularity()`
 
-##### Purpose: Mix Content Similarity + Popularity
 ```python
-def _hybrid_fallback(self, user_history, topk=10, content_weight=0.7, popularity_weight=0.3):
-    """
-    Hybrid fallback: Combine item similarity with popularity.
-    
-    Args:
-        user_history: User's purchase history
-        topk: Number of recommendations
-        content_weight: Weight for content similarity (default 0.7)
-        popularity_weight: Weight for popularity (default 0.3)
-    
-    Returns:
-        list of dict: Hybrid recommendations
-    """
-    # Get content-based candidates (2x topk for diversity)
-    content_recs = self._fallback_item_similarity(user_history, topk=topk*2)
-    
-    # Create score dict
-    scores = {}
-    for rec in content_recs:
-        pid = rec['product_id']
-        # Normalize content score to [0,1]
-        content_score = rec['score']
-        
-        # Get popularity score (already normalized in enriched metadata)
-        product_info = self.item_metadata[self.item_metadata['product_id'] == pid].iloc[0]
-        pop_score = product_info['popularity_score']
-        
-        # Weighted combination
-        final_score = content_weight * content_score + popularity_weight * pop_score
-        scores[pid] = {
-            'final_score': final_score,
-            'content_score': content_score,
-            'popularity_score': pop_score,
-            'product_info': product_info
-        }
-    
-    # Rank by final score
-    top_items = sorted(scores.items(), key=lambda x: x[1]['final_score'], reverse=True)[:topk]
-    
-    # Format output
-    recommendations = []
-    for rank, (pid, data) in enumerate(top_items, 1):
-        recommendations.append({
-            'product_id': pid,
-            'score': data['final_score'],
-            'rank': rank,
-            'fallback': True,
-            'fallback_method': 'hybrid',
-            'content_score': data['content_score'],
-            'popularity_score': data['popularity_score'],
-            **data['product_info'].to_dict()
-        })
-    
-    return recommendations
+recs = fallback.fallback_popularity(
+    topk=10,
+    exclude_ids=None,
+    filter_params=None
+)
+
+# Returns: List of popular products
+# Uses pre-computed top_k_popular_items from loader
+# Optimized: Uses cached enriched popular items if available
 ```
 
-## Component 4: Hybrid Reranking (Optional)
+##### Method 3: `fallback_item_similarity()`
+
+```python
+recs = fallback.fallback_item_similarity(
+    user_history=[100, 200, 300],
+    topk=10,
+    exclude_ids=None,
+    filter_params=None
+)
+
+# Returns: List of content-similar products
+# Uses PhoBERTEmbeddingLoader.compute_user_profile()
+# Caches user profiles for performance
+# Falls back to popularity if PhoBERT unavailable
+```
+
+##### Method 4: `hybrid_fallback()`
+
+```python
+recs = fallback.hybrid_fallback(
+    user_history=[100, 200, 300],
+    topk=10,
+    content_weight=0.7,  # Weight for content similarity
+    popularity_weight=0.3,  # Weight for popularity
+    exclude_ids=None,
+    filter_params=None
+)
+
+# Returns: List of hybrid recommendations
+# Combines content similarity and popularity scores
+# Weighted combination: final_score = content_weight * content + popularity_weight * pop
+```
+
+## Component 4: PhoBERT Embedding Loader
+
+### Module: `service/recommender/phobert_loader.py`
+
+#### Class: `PhoBERTEmbeddingLoader`
+
+##### Purpose
+Singleton class for loading and using PhoBERT product embeddings for content-based recommendations. Pre-normalizes embeddings for fast cosine similarity.
+
+##### Initialization
+
+```python
+from service.recommender.phobert_loader import PhoBERTEmbeddingLoader, get_phobert_loader
+
+# Option 1: Direct instantiation (singleton)
+phobert = PhoBERTEmbeddingLoader(
+    embeddings_path='data/processed/content_based_embeddings/product_embeddings.pt',
+    auto_load=True
+)
+
+# Option 2: Singleton getter (recommended)
+phobert = get_phobert_loader()
+```
+
+##### Method 1: `get_embedding(product_id)`
+
+```python
+emb = phobert.get_embedding(product_id=123)
+
+# Returns: np.ndarray (768,) or (1024,) - Raw embedding
+# None if product not found
+```
+
+##### Method 2: `get_embedding_normalized(product_id)`
+
+```python
+emb_norm = phobert.get_embedding_normalized(product_id=123)
+
+# Returns: L2-normalized embedding for fast cosine similarity
+```
+
+##### Method 3: `compute_user_profile()`
+
+```python
+profile = phobert.compute_user_profile(
+    user_history_items=[100, 200, 300],
+    weights=[1.0, 1.5, 1.0],  # Optional weights (e.g., ratings)
+    strategy='weighted_mean'  # 'mean', 'weighted_mean', or 'max'
+)
+
+# Returns: np.ndarray (768,) - User profile embedding
+# Aggregates history items into single embedding
+```
+
+##### Method 4: `find_similar_items()`
+
+```python
+similar = phobert.find_similar_items(
+    product_id=123,
+    topk=10,
+    exclude_self=True,
+    exclude_ids={400, 500}
+)
+
+# Returns: List[Tuple[int, float]] - [(product_id, similarity_score), ...]
+# Uses pre-normalized embeddings for fast cosine similarity
+```
+
+##### Method 5: `find_similar_to_profile()`
+
+```python
+similar = phobert.find_similar_to_profile(
+    user_profile=profile_embedding,
+    topk=10,
+    exclude_ids={100, 200, 300}
+)
+
+# Returns: List[Tuple[int, float]] - Similar items to user profile
+```
+
+##### Method 6: `precompute_item_similarity()`
+
+```python
+phobert.precompute_item_similarity(max_items=3000)
+
+# Precomputes V @ V.T similarity matrix for small catalogs
+# Speeds up repeated similar item queries
+```
+
+## Component 5: Hybrid Reranking
 
 ### Module: `service/recommender/rerank.py`
 
-#### Function: `rerank_with_signals(recommendations, user_id, weights=None)`
+#### Class: `HybridReranker`
 
 ##### Purpose
-Combine CF scores với additional signals (popularity, quality, content similarity).
+Hybrid reranker combining CF, content (PhoBERT), popularity, and quality signals. Uses global normalization for consistent scoring across requests.
 
-##### Formula
-```
-final_score = α * CF_score + β * popularity + γ * quality + δ * content_similarity
-```
+##### Initialization
 
-##### Implementation
 ```python
-def rerank_with_signals(recommendations, user_id, weights=None):
-    """
-    Rerank recommendations bằng weighted combination of signals.
-    
-    Args:
-        recommendations: List từ CFRecommender.recommend()
-        user_id: For personalized content similarity (optional)
-        weights: Dict {'cf': 0.5, 'popularity': 0.2, 'quality': 0.2, 'content': 0.1}
-    
-    Returns:
-        list: Reranked recommendations
-    """
-    if weights is None:
-        weights = {'cf': 0.6, 'popularity': 0.2, 'quality': 0.2, 'content': 0.0}
-    
-    # Normalize signals
-    cf_scores = normalize([r['score'] for r in recommendations])
-    popularity_scores = normalize([r.get('num_sold_time', 0) for r in recommendations])
-    quality_scores = normalize([r.get('avg_star', 3.0) for r in recommendations])
-    
-    # Content similarity (nếu có PhoBERT embeddings)
-    if weights['content'] > 0:
-        content_scores = compute_content_similarity(user_id, [r['product_id'] for r in recommendations])
-    else:
-        content_scores = [0] * len(recommendations)
-    
-    # Combine
-    for i, rec in enumerate(recommendations):
-        rec['final_score'] = (
-            weights['cf'] * cf_scores[i] +
-            weights['popularity'] * popularity_scores[i] +
-            weights['quality'] * quality_scores[i] +
-            weights['content'] * content_scores[i]
-        )
-    
-    # Re-sort
-    recommendations.sort(key=lambda x: x['final_score'], reverse=True)
-    
-    # Update ranks
-    for i, rec in enumerate(recommendations):
-        rec['rank'] = i + 1
-    
-    return recommendations
+from service.recommender.rerank import HybridReranker, get_reranker, RerankerConfig
+
+# Option 1: Direct instantiation
+reranker = HybridReranker(
+    phobert_loader=phobert_loader,
+    item_metadata=item_metadata,
+    config=None,  # Uses default RerankerConfig if None
+    config_path='service/config/rerank_config.yaml'  # Optional YAML config
+)
+
+# Option 2: Singleton getter (recommended)
+reranker = get_reranker(
+    phobert_loader=phobert_loader,
+    item_metadata=item_metadata,
+    config_path='service/config/rerank_config.yaml'
+)
 ```
 
-## Component 5: API Layer (FastAPI)
+##### Data Class: `RerankerConfig`
+
+```python
+@dataclass
+class RerankerConfig:
+    # Weights for trainable users (≥2 interactions)
+    weights_trainable: Dict[str, float] = {
+        'cf': 0.30,         # SECONDARY - Collaborative signal
+        'content': 0.40,    # PRIMARY - PhoBERT semantic similarity
+        'popularity': 0.20, # TERTIARY - Trending items
+        'quality': 0.10     # BONUS - High-rated products
+    }
+    
+    # Weights for cold-start users (<2 interactions)
+    weights_cold_start: Dict[str, float] = {
+        'content': 0.60,    # DOMINANT - Only reliable signal
+        'popularity': 0.30, # Social proof
+        'quality': 0.10     # Bonus
+    }
+    
+    # Diversity settings
+    diversity_enabled: bool = True
+    diversity_penalty: float = 0.1
+    diversity_threshold: float = 0.85  # BERT similarity threshold
+    
+    # Normalization ranges (global, not local)
+    cf_score_min: float = 0.0
+    cf_score_max: float = 1.5
+    content_score_min: float = -1.0
+    content_score_max: float = 1.0
+    quality_min: float = 1.0
+    quality_max: float = 5.0
+```
+
+##### Data Class: `RerankedResult`
+
+```python
+@dataclass
+class RerankedResult:
+    recommendations: List[Dict[str, Any]]
+    latency_ms: float
+    diversity_score: float
+    weights_used: Dict[str, float]
+    num_candidates: int
+    num_output: int
+```
+
+##### Method 1: `rerank()`
+
+```python
+result = reranker.rerank(
+    cf_recommendations=cf_recs,  # List from CFRecommender
+    user_id=12345,
+    user_history=[100, 200, 300],
+    topk=10,
+    is_cold_start=False  # True for cold-start users
+)
+
+# Returns: RerankedResult
+# Workflow:
+# 1. Compute signals: CF, content, popularity, quality
+# 2. Normalize signals using global ranges (not local min/max)
+# 3. Combine with weights (trainable vs cold-start)
+# 4. Apply diversity penalty if enabled
+# 5. Re-sort and return top-K
+```
+
+##### Method 2: `rerank_cold_start()`
+
+```python
+result = reranker.rerank_cold_start(
+    recommendations=fallback_recs,
+    user_history=[100, 200],
+    topk=10
+)
+
+# Returns: RerankedResult
+# Uses weights_cold_start (no CF signal)
+```
+
+##### Method 3: `update_config()`
+
+```python
+reranker.update_config(
+    weights_trainable={'cf': 0.35, 'content': 0.35, 'popularity': 0.20, 'quality': 0.10},
+    weights_cold_start={'content': 0.65, 'popularity': 0.25, 'quality': 0.10}
+)
+
+# Dynamically update reranking weights
+```
+
+##### Convenience Functions
+
+```python
+from service.recommender.rerank import (
+    rerank_with_signals,  # Legacy function
+    rerank_cold_start,    # Legacy function
+    diversify_recommendations  # Diversity-only function
+)
+```
+
+## Component 6: Cache Manager
+
+### Module: `service/recommender/cache.py`
+
+#### Class: `CacheManager`
+
+##### Purpose
+LRU caching and warm-up strategies for optimizing cold-start path latency (~91% of traffic).
+
+##### Features
+- LRU caches for user profiles, item similarities, fallback results
+- Pre-computation of popular items and their similarities
+- Warm-up strategies for cold-start recommendations
+- Cache invalidation hooks for model updates
+
+##### Initialization
+
+```python
+from service.recommender.cache import CacheManager, get_cache_manager, CacheConfig
+
+# Option 1: Direct instantiation
+cache = CacheManager(
+    config=CacheConfig(
+        max_user_profiles=10000,
+        max_popular_items=1000,
+        ttl_seconds=3600
+    )
+)
+
+# Option 2: Singleton getter (recommended)
+cache = get_cache_manager()
+```
+
+##### Method: `warmup()`
+
+```python
+stats = cache.warmup()
+
+# Pre-computes:
+# - Popular items with enriched metadata
+# - Popular item similarities
+# - Common user profiles
+# Returns warmup statistics
+```
+
+##### Method: `get_popular_items_enriched()`
+
+```python
+popular = cache.get_popular_items_enriched()
+
+# Returns: List[Dict] - Pre-computed popular items with metadata
+# Used by FallbackRecommender for fast popularity fallback
+```
+
+##### Method: `get_user_profile(user_id_hash)`
+
+```python
+profile = cache.get_user_profile(user_id_hash)
+
+# Returns: Cached user profile embedding or None
+# Used by FallbackRecommender to avoid recomputing profiles
+```
+
+##### Method: `get_stats()`
+
+```python
+stats = cache.get_stats()
+
+# Returns: Dict with cache hit rates, sizes, etc.
+```
+
+## Component 7: API Layer (FastAPI)
 
 ### Module: `service/api.py`
+
+#### FastAPI Application
+
+```python
+from fastapi import FastAPI
+from service.recommender import CFRecommender
+
+app = FastAPI(
+    title="CF Recommendation Service",
+    description="Collaborative Filtering recommendation API for Vietnamese cosmetics",
+    version="1.0.0",
+    lifespan=lifespan  # Startup/shutdown handlers
+)
+```
 
 #### Endpoints
 
 ##### 1. Health Check
+
 ```python
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-
-app = FastAPI(title="CF Recommendation Service")
-
-@app.get("/health")
-def health_check():
-    """Check service status."""
-    return {
-        "status": "healthy",
-        "model_id": recommender.model['model_id'],
-        "model_type": recommender.model['model_type']
-    }
+@app.get("/health", response_model=HealthResponse)
+async def health_check():
+    """
+    Check service health and model status.
+    
+    Returns:
+        HealthResponse with model information
+    """
+    # Returns: status, model_id, model_type, num_users, num_items, trainable_users
 ```
 
 ##### 2. Single User Recommendation
-```python
-class RecommendRequest(BaseModel):
-    user_id: int
-    topk: int = 10
-    exclude_seen: bool = True
-    filter_params: dict = None
 
-@app.post("/recommend")
-def recommend(request: RecommendRequest):
+```python
+@app.post("/recommend", response_model=RecommendResponse)
+async def recommend(request: RecommendRequest):
     """
-    Get recommendations cho single user.
+    Get recommendations for a single user.
     
-    Example:
-        POST /recommend
+    Request:
         {
             "user_id": 12345,
             "topk": 10,
             "exclude_seen": true,
-            "filter_params": {"brand": "Innisfree"}
-        }
-    """
-    try:
-        recommendations = recommender.recommend(
-            user_id=request.user_id,
-            topk=request.topk,
-            exclude_seen=request.exclude_seen,
-            filter_params=request.filter_params
-        )
-        
-        return {
-            "user_id": request.user_id,
-            "recommendations": recommendations,
-            "count": len(recommendations),
-            "fallback": recommendations[0].get('fallback', False) if recommendations else False
+            "filter_params": {"brand": "Innisfree"},
+            "rerank": false,
+            "rerank_weights": {...}  # Optional override
         }
     
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    Returns:
+        RecommendResponse with recommendations and metadata
+    """
 ```
 
 ##### 3. Batch Recommendation
-```python
-class BatchRequest(BaseModel):
-    user_ids: list[int]
-    topk: int = 10
-    exclude_seen: bool = True
 
-@app.post("/batch_recommend")
-def batch_recommend(request: BatchRequest):
+```python
+@app.post("/batch_recommend", response_model=BatchResponse)
+async def batch_recommend(request: BatchRequest):
     """
-    Batch recommendations cho multiple users.
-    """
-    results = recommender.batch_recommend(
-        user_ids=request.user_ids,
-        topk=request.topk,
-        exclude_seen=request.exclude_seen
-    )
+    Get recommendations for multiple users.
     
-    return {
-        "results": results,
-        "num_users": len(request.user_ids)
-    }
+    Returns:
+        BatchResponse with results for all users
+        Includes: cf_users, fallback_users counts
+    """
 ```
 
-##### 4. Model Reload
+##### 4. Similar Items
+
 ```python
-@app.post("/reload_model")
-def reload_model():
+@app.post("/similar_items", response_model=SimilarItemsResponse)
+async def similar_items(request: SimilarItemsRequest):
     """
-    Reload model từ registry (hot-reload).
-    """
-    updated = loader.reload_if_updated()
+    Find similar items to a given product.
     
-    if updated:
-        # Reinitialize recommender với new model
-        global recommender
-        recommender = CFRecommender(loader)
-        
-        return {
-            "status": "reloaded",
-            "new_model_id": recommender.model['model_id']
+    Request:
+        {
+            "product_id": 123,
+            "topk": 10,
+            "use_cf": true  # If false, uses PhoBERT
         }
-    else:
-        return {
-            "status": "no_update",
-            "current_model_id": recommender.model['model_id']
-        }
+    """
+```
+
+##### 5. Model Reload
+
+```python
+@app.post("/reload_model", response_model=ReloadResponse)
+async def reload_model():
+    """
+    Hot-reload model from registry.
+    
+    Returns:
+        ReloadResponse with reload status
+    """
+```
+
+##### 6. Service Statistics
+
+```python
+@app.get("/stats")
+async def service_stats():
+    """
+    Get service statistics.
+    
+    Returns:
+        Model info, user counts, cache stats
+    """
+```
+
+##### 7. Cache Management
+
+```python
+@app.get("/cache_stats")
+async def cache_stats():
+    """Get detailed cache statistics."""
+
+@app.post("/cache_warmup")
+async def trigger_warmup(force: bool = False):
+    """Trigger cache warmup."""
+
+@app.post("/cache_clear")
+async def clear_cache():
+    """Clear all caches."""
+```
+
+##### 8. Smart Search Endpoints (Task 09)
+
+```python
+@app.post("/search", response_model=SearchResponse)
+async def search_products(request: SearchRequest):
+    """Semantic search for products using Vietnamese query."""
+
+@app.post("/search/similar", response_model=SearchResponse)
+async def search_similar_products(request: SearchSimilarRequest):
+    """Find products similar to a given product."""
+
+@app.post("/search/profile", response_model=SearchResponse)
+async def search_by_profile(request: SearchByProfileRequest):
+    """Search based on user profile/history."""
 ```
 
 ## Configuration
 
 ### File: `service/config/serving_config.yaml`
+
 ```yaml
 model:
   registry_path: "artifacts/cf/registry.json"
-  auto_reload: true  # Periodically check registry
-  reload_interval_seconds: 300  # 5 minutes
+  data_dir: "data/processed"
+  published_dir: "data/published_data"
 
 serving:
   default_topk: 10
   max_topk: 100
   exclude_seen_default: true
-  
-fallback:
-  strategy: "popularity"  # or "phobert"
-  popularity_metric: "num_sold_time"  # or "avg_star"
+  enable_reranking: true
 
-reranking:
-  enabled: false
-  weights:
-    cf: 0.6
-    popularity: 0.2
-    quality: 0.2
-    content: 0.0
+fallback:
+  default_content_weight: 0.7
+  default_popularity_weight: 0.3
+  enable_cache: true
+
+cache:
+  max_user_profiles: 10000
+  max_popular_items: 1000
+  ttl_seconds: 3600
 
 api:
   host: "0.0.0.0"
   port: 8000
-  workers: 4  # Uvicorn workers
+  workers: 4
   log_level: "info"
+```
+
+### File: `service/config/rerank_config.yaml`
+
+```yaml
+reranking:
+  # Weights for trainable users (≥2 interactions)
+  weights_trainable:
+    cf: 0.30
+    content: 0.40
+    popularity: 0.20
+    quality: 0.10
+  
+  # Weights for cold-start users
+  weights_cold_start:
+    content: 0.60
+    popularity: 0.30
+    quality: 0.10
+  
+  diversity:
+    enabled: true
+    penalty: 0.1
+    threshold: 0.85
+  
+  normalization:
+    cf_score_min: 0.0
+    cf_score_max: 1.5
+    content_score_min: -1.0
+    content_score_max: 1.0
+    quality_min: 1.0
+    quality_max: 5.0
 ```
 
 ## Logging & Monitoring
 
 ### Request Logging
+
+The API automatically logs all requests to:
+- **Console**: Structured logging with user_id, topk, latency, fallback status
+- **Metrics DB**: SQLite database (`logs/service_metrics.db`) for aggregation
+
 ```python
-import logging
-from datetime import datetime
+# Automatic logging in API endpoints
+logger.info(
+    f"user_id={request.user_id}, topk={request.topk}, "
+    f"count={result.count}, fallback={result.is_fallback}, "
+    f"latency={latency:.1f}ms"
+)
 
-logger = logging.getLogger("cf_service")
-
-@app.post("/recommend")
-def recommend(request: RecommendRequest):
-    start_time = datetime.now()
-    
-    try:
-        recommendations = recommender.recommend(...)
-        
-        latency = (datetime.now() - start_time).total_seconds()
-        
-        logger.info(f"user_id={request.user_id}, topk={request.topk}, latency={latency:.3f}s, fallback={recommendations[0].get('fallback', False)}")
-        
-        return {...}
-    except Exception as e:
-        logger.error(f"user_id={request.user_id}, error={str(e)}")
-        raise
+# Background logging to metrics DB
+log_request_metrics(
+    user_id=request.user_id,
+    topk=request.topk,
+    latency_ms=latency,
+    num_recommendations=result.count,
+    fallback=result.is_fallback,
+    fallback_method=result.fallback_method,
+    rerank_enabled=request.rerank,
+    error=None
+)
 ```
 
 ### Metrics to Track
-- **Latency**: p50, p95, p99 response time
-- **Throughput**: Requests per second
-- **Fallback rate**: % requests sử dụng fallback
+- **Latency**: p50, p95, p99 response time (logged per request)
+- **Throughput**: Requests per second (aggregated hourly)
+- **Fallback rate**: % requests using fallback (~91.4% expected)
 - **Error rate**: % failed requests
-- **Cache hit rate**: Nếu có caching layer
+- **Cache hit rate**: From CacheManager stats
+- **Reranking overhead**: Latency difference with/without reranking
 
-## Performance Optimization
+### Background Tasks
 
-### 1. Precompute Item-Item Similarity (Optional)
 ```python
-# For "similar items" recommendations
-self.V_dot_V = self.V @ self.V.T  # (num_items, num_items)
-
-def similar_items(self, product_id, topk=10):
-    i_idx = self.mappings['item_to_idx'][str(product_id)]
-    scores = self.V_dot_V[i_idx]
-    top_k = np.argsort(scores)[::-1][1:topk+1]  # Exclude self
-    return [self.mappings['idx_to_item'][str(i)] for i in top_k]
+# Periodic health aggregation (every minute)
+async def periodic_health_aggregation():
+    # Aggregates metrics from requests table
+    # Updates service_health table
+    # Runs in background task
 ```
 
-### 2. Caching User History
-```python
-from functools import lru_cache
+## Performance Optimizations
 
-@lru_cache(maxsize=10000)
-def _get_user_history_cached(self, user_id):
-    return self._get_user_history(user_id)
-```
+### 1. Singleton Pattern
+- **CFModelLoader**: Single instance shared across requests
+- **PhoBERTEmbeddingLoader**: Single instance, embeddings loaded once
+- **HybridReranker**: Single instance, config cached
+- **CacheManager**: Single instance, shared LRU caches
 
-### 3. Batch Inference
-- Process multiple users simultaneously → amortize overhead
-- Use NumPy vectorization
+### 2. Pre-normalized Embeddings
+- PhoBERT embeddings pre-normalized on load
+- Fast cosine similarity: `embeddings_norm @ query_norm` (no per-request normalization)
+
+### 3. Pre-computed Popular Items
+- Top-K popular items loaded once from `top_k_popular_items.json`
+- Cached enriched popular items in CacheManager
+- Fast fallback for truly new users
+
+### 4. User History Caching
+- User histories loaded once (train split only)
+- Cached in `CFModelLoader.user_history_cache`
+- Fast seen-item filtering
+
+### 5. Batch Inference
+- `batch_recommend()` uses vectorized CF scoring
+- Batch matrix multiplication: `U[u_indices] @ V.T`
+- Amortizes overhead across multiple users
+
+### 6. LRU Caching (CacheManager)
+- User profiles cached (avoid recomputing from history)
+- Popular items enriched and cached
+- Similarity results cached for repeated queries
+
+### 7. Lazy Loading
+- PhoBERT loader initialized only when needed
+- Fallback recommender created on first cold-start request
+- Reranker initialized only when reranking enabled
+
+### 8. Hot Reload
+- Model reload without service restart
+- Registry checked periodically
+- Seamless transition to new best model
 
 ## Deployment
 
@@ -911,102 +1183,58 @@ curl -X POST http://localhost:8000/recommend \
   }'
 ```
 
-## Component 6: BERT Embeddings Integration
+## Component 8: Attribute Filtering
 
-### Module: `service/recommender/phobert_loader.py`
+### Module: `service/recommender/filters.py`
 
-#### Class: `PhoBERTEmbeddingLoader`
+#### Function: `apply_filters()`
 
 ```python
-import numpy as np
-import torch
-from functools import lru_cache
+from service.recommender.filters import apply_filters
 
-class PhoBERTEmbeddingLoader:
-    """
-    Load và cache BERT embeddings cho serving.
-    """
-    
-    def __init__(self, embeddings_path='data/processed/content_based_embeddings/product_embeddings.pt'):
-        self.embeddings_path = embeddings_path
-        self.embeddings = None  # (num_products, 768)
-        self.product_id_to_idx = {}
-        self.idx_to_product_id = {}
-        self._load_embeddings()
-    
-    def _load_embeddings(self):
-        """Load BERT embeddings và create mappings."""
-        bert_data = torch.load(self.embeddings_path, map_location='cpu')
-        
-        self.embeddings = bert_data['embeddings'].numpy()  # (N, 768)
-        product_ids = bert_data['product_ids']
-        
-        # Create mappings
-        for idx, pid in enumerate(product_ids):
-            self.product_id_to_idx[int(pid)] = idx
-            self.idx_to_product_id[idx] = int(pid)
-        
-        # Normalize for fast cosine similarity
-        norms = np.linalg.norm(self.embeddings, axis=1, keepdims=True)
-        self.embeddings_norm = self.embeddings / norms
-        
-        print(f"Loaded {len(self.product_id_to_idx)} BERT embeddings (dim={self.embeddings.shape[1]})")
-    
-    def get_embedding(self, product_id):
-        """Get embedding for single product."""
-        idx = self.product_id_to_idx.get(product_id)
-        if idx is not None:
-            return self.embeddings[idx]
-        return None
-    
-    def compute_user_profile(self, user_history_items, strategy='weighted_mean'):
-        """
-        Compute user profile embedding từ interaction history.
-        
-        Args:
-            user_history_items: List[(product_id, weight)] or List[product_id]
-            strategy: 'mean', 'weighted_mean', 'max'
-        
-        Returns:
-            np.array: (768,) user profile embedding
-        """
-        # Parse history
-        if isinstance(user_history_items[0], tuple):
-            product_ids = [pid for pid, _ in user_history_items]
-            weights = [w for _, w in user_history_items]
-        else:
-            product_ids = user_history_items
-            weights = [1.0] * len(product_ids)
-        
-        # Get embeddings
-        history_embeddings = []
-        history_weights = []
-        
-        for pid, weight in zip(product_ids, weights):
-            emb = self.get_embedding(pid)
-            if emb is not None:
-                history_embeddings.append(emb)
-                history_weights.append(weight)
-        
-        if not history_embeddings:
-            # Fallback: return mean embedding
-            return np.zeros(self.embeddings.shape[1])
-        
-        history_embeddings = np.array(history_embeddings)
-        history_weights = np.array(history_weights).reshape(-1, 1)
-        
-        # Aggregate
-        if strategy == 'mean':
-            profile = np.mean(history_embeddings, axis=0)
-        elif strategy == 'weighted_mean':
-            weights_norm = history_weights / history_weights.sum()
-            profile = (history_embeddings * weights_norm).sum(axis=0)
-        elif strategy == 'max':
-            profile = np.max(history_embeddings, axis=0)
-        else:
-            raise ValueError(f"Unknown strategy: {strategy}")
-        
-        return profile
+filtered = apply_filters(
+    recommendations=recs,
+    filter_params={
+        'brand': 'Innisfree',
+        'skin_type': ['oily', 'acne'],  # List support
+        'price_min': 100000,
+        'price_max': 500000,
+        'min_rating': 4.0
+    }
+)
+
+# Returns: Filtered recommendations with updated ranks
+```
+
+#### Function: `boost_by_attributes()`
+
+```python
+from service.recommender.filters import boost_by_attributes
+
+boosted = boost_by_attributes(
+    recommendations=recs,
+    boost_config={
+        'brand': {'Innisfree': 1.2, 'Cetaphil': 1.1},
+        'skin_type': {'oily': 1.1}
+    },
+    metadata=item_metadata
+)
+
+# Returns: Recommendations with boosted scores
+```
+
+#### Function: `infer_user_preferences()`
+
+```python
+from service.recommender.filters import infer_user_preferences
+
+prefs = infer_user_preferences(
+    user_history=[100, 200, 300],
+    metadata=item_metadata
+)
+
+# Returns: Dict with inferred brand, skin_type preferences
+# Used for personalized boosting
 ```
 
 ## Timeline Estimate
@@ -1019,14 +1247,50 @@ class PhoBERTEmbeddingLoader:
 - **Deployment setup**: 0.5 day
 - **Total**: ~7 days
 
+## Integration Points
+
+### Task 01 (Data Layer)
+- Uses `user_item_mappings.json` for ID mappings
+- Uses `trainable_user_mapping.json` for routing
+- Uses `top_k_popular_items.json` for fallback
+- Uses `enriched_products.parquet` for metadata
+- Uses `interactions.parquet` (train split) for user histories
+
+### Task 02 (Training Pipelines)
+- Loads models from registry (Task 04)
+- Uses `score_range` from model metadata for normalization
+
+### Task 03 (Evaluation Metrics)
+- Uses evaluation metrics for model comparison
+- Can integrate with evaluation pipeline
+
+### Task 04 (Model Registry)
+- Uses `ModelLoader` from registry for model loading
+- Hot-reload when registry updates
+
+### Task 06 (Monitoring)
+- Logs requests to `ServiceMetricsDB`
+- Tracks latency, fallback rate, error rate
+
+### Task 08 (Hybrid Reranking)
+- Uses `HybridReranker` for weighted signal combination
+- Uses `RerankerConfig` for weight management
+
+### Task 09 (Smart Search)
+- Integrated search endpoints in API
+- Shares `PhoBERTEmbeddingLoader` with recommender
+
 ## Success Criteria
 
-- [ ] Load model từ registry (<1 second)
-- [ ] Generate recommendations (<100ms per user CF-only)
-- [ ] Two-stage reranking (<200ms with BERT)
-- [ ] BERT embeddings loaded and cached
-- [ ] Cold-start fallback works
-- [ ] API endpoints functional
-- [ ] Hot-reload model without downtime
-- [ ] Logging tracks latency, fallback rate, rerank metrics
-- [ ] Docker deployment tested
+- [x] Load model từ registry (<1 second)
+- [x] Generate recommendations (<100ms per user CF-only)
+- [x] Two-stage reranking (<200ms with BERT)
+- [x] BERT embeddings loaded and cached
+- [x] Cold-start fallback works (popularity, content, hybrid)
+- [x] API endpoints functional (recommend, batch, similar, search)
+- [x] Hot-reload model without downtime
+- [x] Logging tracks latency, fallback rate, rerank metrics
+- [x] Cache manager with warm-up for cold-start optimization
+- [x] User segmentation routing (trainable vs cold-start)
+- [x] Thread-safe singleton loaders
+- [x] Docker deployment ready

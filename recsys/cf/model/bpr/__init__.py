@@ -4,11 +4,20 @@ BPR (Bayesian Personalized Ranking) Model Module
 This module contains all components for the BPR training pipeline:
 - Step 1: Data Preparation (pre_data.py) - Load positive sets, pairs, hard negatives
 - Step 2: Hard Negative Sampling (sampler.py) - Dual strategy: explicit + implicit
+- Step 2+: Advanced Sampling (advanced_sampler.py) - Contextual, sentiment-contrast, dynamic
 - Step 3: Model Initialization (model_init.py) - Initialize embeddings
 - Step 4: Model Training (trainer.py) - SGD with BPR loss
+- Step 4+: Advanced Training (advanced_trainer.py) - AdamW, dropout, scheduling
 - Step 5: Recommendation Generation (recommender.py)
 - Step 6: Evaluation (evaluation.py)
 - Step 7: Save Artifacts (artifact_saver.py) - Including score ranges for Task 08
+
+Enhanced Features (2025-11):
+- BERT-Enhanced BPR: Initialize item factors from PhoBERT embeddings
+- Sentiment-Aware Training: Weight triplets by confidence scores (rating + comment_quality)
+- Fake Review Detection: Down-weight suspicious reviews with high ratings but low sentiment
+- Advanced Negative Sampling: Contextual (BERT-similar), sentiment-contrast, dynamic difficulty
+- Modern Optimizers: AdamW with differential regularization, embedding dropout, LR scheduling
 
 Usage:
     >>> from recsys.cf.model.bpr import (
@@ -72,6 +81,33 @@ Usage:
     ...     metrics=metrics,
     ...     output_dir='artifacts/cf/bpr'
     ... )
+    >>>
+    >>> # === ENHANCED: BERT-Enhanced BPR with Sentiment-Aware Training ===
+    >>> from recsys.cf.model.bert_enhanced_bpr import BERTEnhancedBPR, SentimentAwareConfig
+    >>> 
+    >>> # Configure sentiment weighting
+    >>> sentiment_config = SentimentAwareConfig(
+    ...     use_sentiment_weighting=True,
+    ...     positive_confidence_threshold=4.5,
+    ...     suspicious_penalty=0.5,
+    ...     high_confidence_bonus=1.5
+    ... )
+    >>> 
+    >>> # Initialize BERT-Enhanced BPR
+    >>> model = BERTEnhancedBPR(
+    ...     bert_embeddings_path='data/processed/content_based_embeddings/product_embeddings.pt',
+    ...     factors=64,
+    ...     sentiment_config=sentiment_config
+    ... )
+    >>> 
+    >>> # Train with confidence-weighted loss
+    >>> summary = model.fit(
+    ...     positive_pairs=data['positive_pairs'],
+    ...     confidence_scores=data['confidence_scores'],  # From BPRDataPreparer
+    ...     user_pos_sets=data['user_pos_sets'],
+    ...     hard_neg_sets=data['hard_neg_sets'],
+    ...     ...
+    ... )
 """
 
 from .pre_data import (
@@ -105,26 +141,68 @@ from .artifact_saver import (
     compute_bpr_score_range
 )
 
+from .advanced_sampler import (
+    AdvancedTripletSampler,
+    SamplingStrategy,
+    DynamicSamplingConfig,
+    ContextualNegativeSampler,
+    SentimentContrastSampler,
+    PopularNegativeSampler,
+    create_advanced_sampler
+)
+
+from .advanced_trainer import (
+    AdvancedBPRTrainer,
+    OptimizerType,
+    OptimizerConfig,
+    TrainingConfig,
+    SchedulerType,
+    LearningRateScheduler,
+    AdamWOptimizer,
+    AdaGradOptimizer,
+    EmbeddingDropout
+)
+
 __all__ = [
     # Step 1: Data Preparation
     'BPRDataLoader',
     'load_bpr_data',
     'prepare_bpr_data',
     
-    # Step 2: Triplet Sampling
+    # Step 2: Triplet Sampling (Basic)
     'TripletSampler',
     'sample_triplets',
     'HardNegativeMixer',
+    
+    # Step 2+: Advanced Sampling
+    'AdvancedTripletSampler',
+    'SamplingStrategy',
+    'DynamicSamplingConfig',
+    'ContextualNegativeSampler',
+    'SentimentContrastSampler',
+    'PopularNegativeSampler',
+    'create_advanced_sampler',
     
     # Step 3: Model Initialization
     'BPRModelInitializer',
     'initialize_bpr_model',
     'get_bpr_preset_config',
     
-    # Step 4: Model Training
+    # Step 4: Model Training (Basic)
     'BPRTrainer',
     'train_bpr_model',
     'TrainingHistory',
+    
+    # Step 4+: Advanced Training
+    'AdvancedBPRTrainer',
+    'OptimizerType',
+    'OptimizerConfig',
+    'TrainingConfig',
+    'SchedulerType',
+    'LearningRateScheduler',
+    'AdamWOptimizer',
+    'AdaGradOptimizer',
+    'EmbeddingDropout',
     
     # Step 7: Artifact Saving
     'BPRArtifacts',

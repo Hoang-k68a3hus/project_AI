@@ -221,14 +221,18 @@ def main():
             if result_bpr.returncode != 0:
                 raise Exception(f"BPR training failed: {result_bpr.stderr}")
         
-        # Select best model
+        # Select best model (using registry)
         if args.auto_select:
-            logger.info("Selecting best model...")
-            subprocess.run([
-                'python', 'scripts/update_registry.py',
-                '--auto-select',
-                '--metric', 'ndcg@10'
-            ])
+            logger.info("Selecting best model from registry...")
+            from recsys.cf.registry import ModelRegistry
+            
+            registry = ModelRegistry()
+            best = registry.select_best_model(metric='ndcg@10', min_improvement=0.0)
+            
+            if best:
+                logger.info(f"Best model selected: {best['model_id']} (ndcg@10={best['value']:.4f})")
+            else:
+                logger.warning("No best model could be selected")
         
         logger.info("Training completed successfully")
         
@@ -281,47 +285,68 @@ def main():
     
     try:
         # Load registry
-        registry = load_registry_json('artifacts/cf/registry.json')
-        current_best = registry['current_best']['model_id']
+        from recsys.cf.registry import ModelRegistry
+        
+        registry = ModelRegistry()
+        current_best_info = registry.get_current_best()
+        
+        if not current_best_info:
+            raise Exception("No current best model in registry")
+        
+        current_best = current_best_info['model_id']
         logger.info(f"Current best model in registry: {current_best}")
         
         # Check service status
-        health = requests.get(f"{args.service_url}/health").json()
-        service_model = health['model_id']
-        logger.info(f"Service currently serving: {service_model}")
+        health = requests.get(f"{args.service_url}/health", timeout=10).json()
+        service_model = health.get('model_id')
+        service_version = health.get('model_version')
+        logger.info(f"Service currently serving: {service_model} (version: {service_version})")
         
-        if current_best == service_model:
+        # Compare with registry
+        best_model_info = current_best_info.get('model_info', {})
+        best_version = best_model_info.get('version')
+        
+        if current_best == service_model and best_version == service_version:
             logger.info("Service already serving latest model")
             return 0
         
         # Model update needed
-        logger.info(f"Update needed: {service_model} → {current_best}")
+        logger.info(f"Update needed: {service_model} → {current_best} (v{best_version})")
         
         if args.dry_run:
             logger.info("Dry-run mode, skipping reload")
             return 0
         
-        # Trigger reload
+        # Trigger reload via service endpoint
         logger.info("Triggering model reload...")
-        response = requests.post(f"{args.service_url}/reload_model")
+        response = requests.post(f"{args.service_url}/reload_model", timeout=30)
         
         if response.status_code == 200:
             result = response.json()
             logger.info(f"Reload successful: {result}")
             
             # Verify
-            health_after = requests.get(f"{args.service_url}/health").json()
-            if health_after['model_id'] == current_best:
+            health_after = requests.get(f"{args.service_url}/health", timeout=10).json()
+            if health_after.get('model_id') == current_best:
                 logger.info("Deployment verified successfully")
+                
+                # Log deployment to registry operations
+                from recsys.cf.monitoring.registry_monitor import setup_registry_monitoring
+                monitor = setup_registry_monitoring()
+                monitor.log_operation('DEPLOY', current_best, {
+                    'service_url': args.service_url,
+                    'previous_model': service_model,
+                    'deployment_time': datetime.now().isoformat()
+                })
                 
                 send_alert(
                     subject="Model Deployed",
-                    message=f"Successfully deployed {current_best} to production",
+                    message=f"Successfully deployed {current_best} (v{best_version}) to production",
                     severity="info"
                 )
                 return 0
             else:
-                raise Exception(f"Verification failed: expected {current_best}, got {health_after['model_id']}")
+                raise Exception(f"Verification failed: expected {current_best}, got {health_after.get('model_id')}")
         else:
             raise Exception(f"Reload failed: {response.status_code} {response.text}")
     
@@ -403,7 +428,10 @@ def main():
         )
         logger.info(f"Saved embeddings to {output_file}")
         
-        # Register in registry
+        # Register in BERT registry
+        from recsys.cf.registry import BERTEmbeddingsRegistry
+        
+        bert_registry = BERTEmbeddingsRegistry()
         metadata = {
             'model_name': args.model,
             'embedding_dim': embeddings.shape[1],
@@ -412,7 +440,10 @@ def main():
             'data_hash': compute_data_hash(products)
         }
         
-        version = register_bert_embeddings(output_file, metadata)
+        version = bert_registry.register_embeddings(
+            embeddings_path=output_file,
+            metadata=metadata
+        )
         logger.info(f"Registered embeddings version: {version}")
         
         # Send notification
@@ -458,22 +489,53 @@ import os
 from datetime import datetime, timedelta
 
 def check_bert_embedding_freshness(logger, threshold_days=7):
-    """Check if BERT embeddings are up-to-date."""
-    embedding_file = 'data/processed/content_based_embeddings/product_embeddings.pt'
+    """Check if BERT embeddings are up-to-date using registry."""
+    from recsys.cf.registry import BERTEmbeddingsRegistry
     
-    if not os.path.exists(embedding_file):
-        logger.warning(f"BERT embedding file not found: {embedding_file}")
+    try:
+        bert_registry = BERTEmbeddingsRegistry()
+        current = bert_registry.get_current_best()
+        
+        if not current:
+            logger.warning("No BERT embeddings registered in registry")
+            return False
+        
+        # Check age
+        created_at = datetime.fromisoformat(current['metadata']['created_at'])
+        age_days = (datetime.now() - created_at).days
+        
+        if age_days > threshold_days:
+            logger.warning(f"BERT embeddings are {age_days} days old (threshold: {threshold_days})")
+            return False
+        
+        logger.info(f"BERT embeddings are fresh ({age_days} days old, version: {current['version']})")
+        return True
+    
+    except Exception as e:
+        logger.warning(f"Could not check BERT embedding freshness: {e}")
         return False
+
+def check_registry_health(logger):
+    """Check registry health."""
+    from recsys.cf.registry import ModelRegistry
+    from recsys.cf.monitoring.registry_monitor import check_registry_health
     
-    mod_time = datetime.fromtimestamp(os.path.getmtime(embedding_file))
-    age_days = (datetime.now() - mod_time).days
+    try:
+        health = check_registry_health()
+        
+        if health['status'] == 'unhealthy':
+            logger.error(f"Registry health issues: {health['issues']}")
+            return False
+        
+        if health['warnings']:
+            logger.warning(f"Registry warnings: {health['warnings']}")
+        
+        logger.info("Registry health check passed")
+        return True
     
-    if age_days > threshold_days:
-        logger.warning(f"BERT embeddings are {age_days} days old (threshold: {threshold_days})")
+    except Exception as e:
+        logger.error(f"Registry health check failed: {e}")
         return False
-    
-    logger.info(f"BERT embeddings are fresh ({age_days} days old)")
-    return True
 
 def main():
     parser = argparse.ArgumentParser(description="Service health check")
@@ -488,6 +550,16 @@ def main():
         # Check service alive
         health = requests.get(f"{args.service_url}/health", timeout=5).json()
         logger.info(f"Service healthy: {health}")
+        
+        # Check registry health
+        registry_healthy = check_registry_health(logger)
+        if not registry_healthy:
+            send_alert(
+                subject="Registry Health Check Failed",
+                message="Registry has health issues. Check logs for details.",
+                severity="critical"
+            )
+            return 1
         
         # Check BERT embedding freshness
         bert_fresh = check_bert_embedding_freshness(logger, args.bert_freshness_days)
@@ -569,6 +641,9 @@ if __name__ == '__main__':
 
 # Cleanup old logs - Monthly on 1st at midnight
 0 0 1 * * cd /path/to/project && find logs/ -name "*.log" -mtime +30 -delete
+
+# Registry cleanup - Monthly on 1st at 1am (keep last 5 versions)
+0 1 1 * * cd /path/to/project && python scripts/cleanup_registry.py --keep-count 5 >> logs/cron_registry_cleanup.log 2>&1
 ```
 
 ### Option 2: Task Scheduler (Windows)
@@ -599,6 +674,11 @@ Register-ScheduledTask -TaskName "CF_Deploy" -Action $action -Trigger $trigger
 $action = New-ScheduledTaskAction -Execute "python" -Argument "scripts/health_check.py" -WorkingDirectory "D:\app\IAI\project"
 $trigger = New-ScheduledTaskTrigger -Once -At 12am -RepetitionInterval (New-TimeSpan -Hours 1) -RepetitionDuration ([TimeSpan]::MaxValue)
 Register-ScheduledTask -TaskName "CF_HealthCheck" -Action $action -Trigger $trigger
+
+# Registry Cleanup - Monthly on 1st at 1am
+$action = New-ScheduledTaskAction -Execute "python" -Argument "scripts/cleanup_registry.py --keep-count 5" -WorkingDirectory "D:\app\IAI\project"
+$trigger = New-ScheduledTaskTrigger -Monthly -DaysOfMonth 1 -At 1am
+Register-ScheduledTask -TaskName "CF_RegistryCleanup" -Action $action -Trigger $trigger
 ```
 
 ### Option 3: Airflow DAG (Advanced)
@@ -657,10 +737,10 @@ task_train_bpr = BashOperator(
     dag=dag
 )
 
-# Task 5: Select Best Model
-task_select_best = BashOperator(
+# Task 5: Select Best Model (using registry)
+task_select_best = PythonOperator(
     task_id='select_best_model',
-    bash_command='cd /path/to/project && python scripts/update_registry.py --auto-select',
+    python_callable=lambda: ModelRegistry().select_best_model(metric='ndcg@10'),
     dag=dag
 )
 
@@ -784,7 +864,11 @@ CREATE TABLE pipeline_runs (
     -- Outputs
     data_version TEXT,
     models_trained TEXT,  -- JSON list
-    best_model_selected TEXT
+    best_model_selected TEXT,
+    
+    -- Registry Integration
+    models_registered TEXT,  -- JSON list of registered model_ids
+    registry_updated BOOLEAN
 );
 ```
 
@@ -842,7 +926,180 @@ st.bar_chart(avg_duration.set_index('pipeline_type')['avg_duration_minutes'])
 conn.close()
 ```
 
-## Component 5: Cleanup & Maintenance
+## Component 5: Registry-Aware Automation
+
+### Enhanced Training Script with Registry
+
+#### File: `scripts/train_cf.py` (Updated)
+```python
+"""
+Train CF model và auto-register in registry.
+
+Usage:
+    python scripts/train_cf.py --model als --config config/training_config.yaml
+"""
+
+import argparse
+import logging
+import sys
+from datetime import datetime
+
+from recsys.cf.registry import ModelRegistry
+from recsys.cf.training import train_als, train_bpr
+from recsys.cf.evaluation import evaluate_model
+
+def main():
+    parser = argparse.ArgumentParser(description="Train CF model")
+    parser.add_argument('--model', choices=['als', 'bpr'], required=True)
+    parser.add_argument('--config', default='config/training_config.yaml')
+    parser.add_argument('--auto-register', action='store_true', default=True,
+                       help='Auto-register model in registry')
+    parser.add_argument('--auto-select', action='store_true',
+                       help='Auto-select as best if improved')
+    args = parser.parse_args()
+    
+    logger = setup_logger('train_cf', f'logs/cf/{args.model}.log')
+    logger.info(f"Training {args.model.upper()} model started")
+    
+    try:
+        # Load config
+        config = load_config(args.config)
+        
+        # Train model
+        if args.model == 'als':
+            model, artifacts = train_als(config)
+        else:
+            model, artifacts = train_bpr(config)
+        
+        logger.info(f"Training completed, evaluating...")
+        
+        # Evaluate
+        metrics = evaluate_model(model, config['test_data'])
+        logger.info(f"Evaluation metrics: {metrics}")
+        
+        # Register in registry
+        if args.auto_register:
+            registry = ModelRegistry()
+            model_id = registry.register_model(
+                artifacts_path=artifacts['path'],
+                model_type=args.model,
+                hyperparameters=config['hyperparameters'],
+                metrics=metrics,
+                training_info={
+                    'training_time_seconds': artifacts['training_time'],
+                    'run_id': artifacts['run_id']
+                },
+                data_version=config.get('data_version')
+            )
+            logger.info(f"Model registered: {model_id}")
+            
+            # Auto-select if improved
+            if args.auto_select:
+                best = registry.select_best_model(metric='ndcg@10', min_improvement=0.0)
+                if best and best['model_id'] == model_id:
+                    logger.info(f"New best model selected: {model_id}")
+        
+        return 0
+    
+    except Exception as e:
+        logger.error(f"Training failed: {str(e)}", exc_info=True)
+        send_alert(
+            subject=f"{args.model.upper()} Training Failed",
+            message=f"Error: {str(e)}",
+            severity="critical"
+        )
+        return 1
+
+if __name__ == '__main__':
+    sys.exit(main())
+```
+
+### Registry Cleanup Script
+
+#### File: `scripts/cleanup_registry.py`
+```python
+"""
+Cleanup old models from registry.
+
+Usage:
+    python scripts/cleanup_registry.py --keep-count 5 --dry-run
+"""
+
+import argparse
+import logging
+from recsys.cf.registry import ModelRegistry
+from recsys.cf.registry.utils import cleanup_old_artifacts
+
+def main():
+    parser = argparse.ArgumentParser(description="Cleanup old registry models")
+    parser.add_argument('--keep-count', type=int, default=5,
+                       help='Number of versions to keep per model type')
+    parser.add_argument('--dry-run', action='store_true',
+                       help='Show what would be deleted without deleting')
+    parser.add_argument('--archive-only', action='store_true',
+                       help='Archive instead of delete')
+    args = parser.parse_args()
+    
+    logger = setup_logger('cleanup_registry', 'logs/cleanup_registry.log')
+    logger.info("Registry cleanup started")
+    
+    try:
+        registry = ModelRegistry()
+        
+        # Get current best to protect it
+        current_best = registry.get_current_best()
+        current_best_id = current_best['model_id'] if current_best else None
+        
+        # List all models by type
+        models_by_type = {}
+        for model_id, model in registry._registry['models'].items():
+            mtype = model['model_type']
+            if mtype not in models_by_type:
+                models_by_type[mtype] = []
+            models_by_type[mtype].append((model_id, model))
+        
+        # Cleanup each type
+        cleaned = []
+        for mtype, models in models_by_type.items():
+            # Sort by created_at (newest first)
+            models.sort(key=lambda x: x[1]['created_at'], reverse=True)
+            
+            # Keep top N + current best
+            to_keep = models[:args.keep_count]
+            if current_best_id:
+                # Ensure current best is kept
+                best_model = next((m for m in models if m[0] == current_best_id), None)
+                if best_model and best_model not in to_keep:
+                    to_keep.append(best_model)
+            
+            to_remove = [m for m in models if m not in to_keep]
+            
+            for model_id, model in to_remove:
+                if model['status'] == 'archived':
+                    # Already archived, can delete
+                    if not args.dry_run:
+                        registry.delete_model(model_id, delete_files=True)
+                    logger.info(f"{'Would delete' if args.dry_run else 'Deleted'}: {model_id}")
+                    cleaned.append(model_id)
+                elif args.archive_only:
+                    # Archive instead of delete
+                    if not args.dry_run:
+                        registry.archive_model(model_id)
+                    logger.info(f"{'Would archive' if args.dry_run else 'Archived'}: {model_id}")
+                    cleaned.append(model_id)
+        
+        logger.info(f"Cleanup completed: {len(cleaned)} models {'would be' if args.dry_run else ''} cleaned")
+        return 0
+    
+    except Exception as e:
+        logger.error(f"Cleanup failed: {str(e)}", exc_info=True)
+        return 1
+
+if __name__ == '__main__':
+    sys.exit(main())
+```
+
+## Component 6: Cleanup & Maintenance
 
 ### Log Rotation
 
@@ -911,10 +1168,12 @@ if __name__ == '__main__':
 - [ ] Log cleanup
 
 ### Monthly Tasks
+- [ ] Registry cleanup (keep last 5 versions per type)
 - [ ] Archive old models
 - [ ] Database maintenance
 - [ ] Dependency updates
 - [ ] Security audit
+- [ ] Registry health audit
 
 ## Dependencies
 
@@ -937,10 +1196,15 @@ streamlit>=1.20.0  # Dashboard
 
 ## Success Criteria
 
-- [ ] All scripts run end-to-end
+- [ ] All scripts run end-to-end với registry integration
+- [ ] Models auto-registered sau training
+- [ ] Best model auto-selected from registry
+- [ ] Deployment uses ModelLoader hot-reload
+- [ ] Registry health checks in automation
 - [ ] Scheduler executes tasks correctly
 - [ ] Errors handled với retry logic
-- [ ] Alerts sent on failures
-- [ ] Pipeline dashboard functional
+- [ ] Alerts sent on failures (including registry issues)
+- [ ] Pipeline dashboard functional với registry metrics
+- [ ] Registry cleanup runs monthly
 - [ ] Logs rotated automatically
 - [ ] Documentation complete

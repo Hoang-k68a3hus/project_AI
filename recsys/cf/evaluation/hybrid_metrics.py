@@ -484,11 +484,15 @@ class ColdStartCoverageMetric(HybridMetric):
         cold_items = np.where(item_counts < threshold)[0]
         warm_items = np.where(item_counts >= threshold)[0]
         
+        # Avoid division by zero
+        total_items = len(item_counts)
+        cold_percentage = (len(cold_items) / total_items * 100) if total_items > 0 else 0.0
+        
         return {
             'cold_threshold': threshold,
             'num_cold_items': len(cold_items),
             'num_warm_items': len(warm_items),
-            'cold_percentage': len(cold_items) / len(item_counts) * 100 if len(item_counts) > 0 else 0,
+            'cold_percentage': cold_percentage,
             'cold_items': cold_items.tolist()
         }
 

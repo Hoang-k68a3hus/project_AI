@@ -77,7 +77,44 @@ Final Top-K (e.g., K=10)
 - **Semantic Alignment** (Task 03): `compute_semantic_alignment()` measures user profile → recommendation relevance
 - **Model Registry** (Task 04): Tracks BERT embedding versions and compatibility with CF models
 
-## Component 1: PhoBERT Integration
+## Component 1: PhoBERT Integration (Registry-Enabled)
+
+### Registry Integration
+
+#### Loading Embeddings from Registry
+```python
+from recsys.cf.registry import BERTEmbeddingsRegistry, load_bert_embeddings
+
+# Option 1: Load current best embeddings
+embeddings, metadata = load_bert_embeddings()
+
+# Option 2: Load specific version
+embeddings, metadata = load_bert_embeddings(version='bert_20250115_120000')
+
+# Option 3: Use registry instance
+bert_registry = BERTEmbeddingsRegistry()
+current = bert_registry.get_current_best()
+if current:
+    embeddings, metadata = load_bert_embeddings(version=current['version'])
+```
+
+#### Embedding Version Compatibility
+```python
+# Link embeddings to CF model (for tracking compatibility)
+from recsys.cf.registry import ModelRegistry, BERTEmbeddingsRegistry
+
+model_registry = ModelRegistry()
+bert_registry = BERTEmbeddingsRegistry()
+
+# After training model with BERT init
+model_id = model_registry.register_model(...)
+embedding_version = bert_registry.get_current_best()['version']
+
+# Link embeddings to model
+bert_registry.link_to_model(embedding_version, model_id)
+```
+
+## Component 2: PhoBERT Integration (Implementation)
 
 ### Load PhoBERT Embeddings
 
@@ -85,50 +122,137 @@ Final Top-K (e.g., K=10)
 
 **NOTE**: This module is now superseded by `PhoBERTEmbeddingLoader` in Task 05 (`serving_layer.md`). The class below provides basic embedding loading, while the Task 05 implementation includes advanced features like user profile computation, LRU caching, and normalized embeddings.
 
-##### Class: `PhoBERTEmbeddings` (Basic Version)
+##### Class: `PhoBERTEmbeddings` (Registry-Integrated Version)
 ```python
 import numpy as np
 import torch
 from pathlib import Path
+from recsys.cf.registry import BERTEmbeddingsRegistry, load_bert_embeddings
 
 class PhoBERTEmbeddings:
     """
     Load và manage PhoBERT embeddings cho content-based similarity.
     
+    UPDATED: Now uses BERTEmbeddingsRegistry for version management.
+    
     For production use, prefer PhoBERTEmbeddingLoader from Task 05 which includes:
     - User profile computation (interaction-weighted, TF-IDF)
     - LRU caching for performance
     - Normalized embeddings for cosine similarity
+    - Registry integration for version tracking
     """
     
-    def __init__(self, embeddings_path='data/processed/content_based_embeddings'):
-        self.embeddings_path = Path(embeddings_path)
+    def __init__(
+        self, 
+        embeddings_path=None,
+        embedding_version=None,
+        use_registry=True
+    ):
+        """
+        Initialize PhoBERT embeddings loader.
+        
+        Args:
+            embeddings_path: Direct path to embeddings (legacy mode)
+            embedding_version: Version from registry (None = current best)
+            use_registry: Use BERTEmbeddingsRegistry (recommended)
+        """
+        self.use_registry = use_registry
+        self.embedding_version = embedding_version
         self.product_embeddings = None  # Shape: (num_products, 768)
         self.product_id_to_idx = {}
         self.idx_to_product_id = {}
+        self.metadata = {}
         
-        self._load_embeddings()
+        if use_registry:
+            self._load_from_registry(embedding_version)
+        else:
+            # Legacy mode: direct file loading
+            if embeddings_path is None:
+                embeddings_path = 'data/processed/content_based_embeddings'
+            self.embeddings_path = Path(embeddings_path)
+            self._load_embeddings_direct()
     
-    def _load_embeddings(self):
-        """Load PhoBERT embeddings từ .pt file."""
+    def _load_from_registry(self, version=None):
+        """Load PhoBERT embeddings từ registry."""
+        try:
+            embeddings_array, metadata = load_bert_embeddings(version=version)
+            self.product_embeddings = embeddings_array
+            self.metadata = metadata
+            
+            # Load product IDs mapping (from metadata or separate file)
+            embedding_path = Path(metadata['path'])
+            
+            # Try to load product_ids from .pt file
+            if (embedding_path / 'product_embeddings.pt').exists():
+                embeddings_dict = torch.load(
+                    embedding_path / 'product_embeddings.pt', 
+                    map_location='cpu',
+                    weights_only=False
+                )
+                if isinstance(embeddings_dict, dict) and 'product_ids' in embeddings_dict:
+                    product_ids = embeddings_dict['product_ids']
+                    if isinstance(product_ids, torch.Tensor):
+                        product_ids = product_ids.numpy()
+                    
+                    # Create mappings
+                    for idx, pid in enumerate(product_ids):
+                        self.product_id_to_idx[int(pid)] = idx
+                        self.idx_to_product_id[idx] = int(pid)
+                else:
+                    # Fallback: assume sequential IDs
+                    num_items = metadata.get('num_items', len(embeddings_array))
+                    for idx in range(num_items):
+                        self.product_id_to_idx[idx] = idx
+                        self.idx_to_product_id[idx] = idx
+            else:
+                # Fallback: sequential IDs
+                num_items = metadata.get('num_items', len(embeddings_array))
+                for idx in range(num_items):
+                    self.product_id_to_idx[idx] = idx
+                    self.idx_to_product_id[idx] = idx
+            
+            print(f"Loaded {len(self.product_id_to_idx)} product embeddings from registry (version: {metadata.get('version', 'unknown')})")
+            
+        except Exception as e:
+            print(f"Failed to load from registry: {e}")
+            print("Falling back to direct file loading...")
+            self.use_registry = False
+            self._load_embeddings_direct()
+    
+    def _load_embeddings_direct(self):
+        """Load PhoBERT embeddings từ file directly (legacy mode)."""
         # Load product embeddings (standardized path from Task 01)
         emb_file = self.embeddings_path / 'product_embeddings.pt'
         
         if emb_file.exists():
-            embeddings_dict = torch.load(emb_file, map_location='cpu')
+            embeddings_dict = torch.load(emb_file, map_location='cpu', weights_only=False)
             
             # Convert to numpy
-            self.product_embeddings = embeddings_dict['embeddings'].numpy()  # (N, 768)
-            product_ids = embeddings_dict['product_ids']  # List hoặc tensor
+            if isinstance(embeddings_dict, dict):
+                self.product_embeddings = embeddings_dict['embeddings'].numpy()  # (N, 768)
+                product_ids = embeddings_dict['product_ids']  # List hoặc tensor
+            else:
+                # Direct tensor
+                self.product_embeddings = embeddings_dict.numpy() if isinstance(embeddings_dict, torch.Tensor) else embeddings_dict
+                product_ids = list(range(len(self.product_embeddings)))
             
             # Create mappings
+            if isinstance(product_ids, torch.Tensor):
+                product_ids = product_ids.numpy()
+            
             for idx, pid in enumerate(product_ids):
                 self.product_id_to_idx[int(pid)] = idx
                 self.idx_to_product_id[idx] = int(pid)
             
-            print(f"Loaded {len(self.product_id_to_idx)} product embeddings")
+            print(f"Loaded {len(self.product_id_to_idx)} product embeddings (direct mode)")
         else:
             raise FileNotFoundError(f"Embeddings file not found: {emb_file}")
+    
+    def get_embedding_version(self):
+        """Get current embedding version from registry."""
+        if self.use_registry and self.metadata:
+            return self.metadata.get('version')
+        return None
     
     def get_embedding(self, product_id):
         """
@@ -221,7 +345,7 @@ class PhoBERTEmbeddings:
         return similarities
 ```
 
-## Component 2: Reranking Module
+## Component 3: Reranking Module
 
 ### Module: `service/recommender/rerank.py`
 
@@ -290,6 +414,21 @@ class HybridReranker:
         
         # Load global statistics for normalization (from Task 01 processed data)
         self._load_global_stats()
+        
+        # Track embedding version from registry
+        self.embedding_version = phobert_embeddings.get_embedding_version()
+        if self.embedding_version:
+            import logging
+            logger = logging.getLogger(__name__)
+            logger.info(f"Using BERT embeddings version: {self.embedding_version}")
+    
+    def get_embedding_info(self):
+        """Get embedding metadata for monitoring."""
+        return {
+            'version': self.embedding_version,
+            'num_items': len(self.phobert.product_id_to_idx) if self.phobert.product_id_to_idx else None,
+            'embedding_dim': self.phobert.product_embeddings.shape[1] if self.phobert.product_embeddings is not None else None
+        }
 
 ##### Method 1: `rerank(cf_recommendations, user_id, user_history=None)`
 ```python
@@ -594,7 +733,7 @@ def _apply_diversity_penalty(self, scores, candidate_ids):
     return penalized_scores
 ```
 
-## Component 3: Attribute Filtering
+## Component 4: Attribute Filtering
 
 ### Module: `service/recommender/filters.py`
 
@@ -678,7 +817,7 @@ def boost_by_attributes(recommendations, boost_config, metadata):
     return recommendations
 ```
 
-## Component 4: Integration với CFRecommender
+## Component 5: Integration với CFRecommender
 
 ### Updated Method: `recommend()` với Reranking
 
@@ -692,7 +831,23 @@ class CFRecommender:
         # Reranking components
         self.enable_reranking = enable_reranking
         if enable_reranking:
-            self.phobert_embeddings = PhoBERTEmbeddings()
+            # Load embeddings from registry (current best)
+            from recsys.cf.registry import BERTEmbeddingsRegistry
+            
+            bert_registry = BERTEmbeddingsRegistry()
+            current_embeddings = bert_registry.get_current_best()
+            
+            if current_embeddings:
+                embedding_version = current_embeddings['version']
+                logger.info(f"Loading BERT embeddings version: {embedding_version}")
+                self.phobert_embeddings = PhoBERTEmbeddings(
+                    embedding_version=embedding_version,
+                    use_registry=True
+                )
+            else:
+                logger.warning("No BERT embeddings in registry, using direct file loading")
+                self.phobert_embeddings = PhoBERTEmbeddings(use_registry=False)
+            
             self.reranker = HybridReranker(
                 phobert_embeddings=self.phobert_embeddings,
                 item_metadata=self.item_metadata
@@ -727,9 +882,32 @@ class CFRecommender:
         
         # Return top-K after reranking
         return cf_recommendations[:topk]
+    
+    def reload_embeddings(self, embedding_version=None):
+        """
+        Hot-reload BERT embeddings from registry.
+        
+        Args:
+            embedding_version: Version to load (None = current best)
+        
+        Returns:
+            bool: True if embeddings changed
+        """
+        if not self.enable_reranking or not self.reranker:
+            logger.warning("Reranking not enabled, cannot reload embeddings")
+            return False
+        
+        return self.reranker.reload_embeddings(embedding_version)
+    
+    def get_embedding_info(self):
+        """Get current BERT embedding metadata."""
+        if not self.enable_reranking or not self.reranker:
+            return None
+        
+        return self.reranker.get_embedding_info()
 ```
 
-## Component 5: Configuration Management
+## Component 6: Configuration Management
 
 ### File: `service/config/rerank_config.yaml`
 ```yaml
@@ -761,7 +939,7 @@ reranking:
       oily: 1.1  # Boost cho oily skin products (nếu user oily skin)
 ```
 
-## Component 6: Evaluation
+## Component 7: Evaluation
 
 ### Metric: Diversity
 
@@ -875,7 +1053,99 @@ def main():
     print(f"Semantic Alignment: {hybrid_alignment:.3f}")
 ```
 
-## Component 7: Use Cases
+## Component 8: Registry-Aware Hybrid Reranking
+
+### Hot-Reload Embeddings
+
+#### Method: `reload_embeddings()` (Added to HybridReranker)
+```python
+def reload_embeddings(self, embedding_version=None):
+    """
+    Hot-reload BERT embeddings from registry.
+    
+    Args:
+        embedding_version: Version to load (None = current best)
+    
+    Returns:
+        bool: True if embeddings changed
+    """
+    from recsys.cf.registry import load_bert_embeddings
+    
+    old_version = self.embedding_version
+    
+    # Load new embeddings
+    embeddings_array, metadata = load_bert_embeddings(version=embedding_version)
+    
+    # Update embeddings
+    self.phobert_embeddings.product_embeddings = embeddings_array
+    self.phobert_embeddings.metadata = metadata
+    self.embedding_version = metadata.get('version')
+    
+    # Clear any caches
+    if hasattr(self.phobert_embeddings, 'clear_cache'):
+        self.phobert_embeddings.clear_cache()
+    
+    changed = old_version != self.embedding_version
+    if changed:
+        logger.info(f"Embeddings reloaded: {old_version} → {self.embedding_version}")
+    
+    return changed
+```
+
+### Embedding-Model Compatibility Check
+
+#### Method: `check_embedding_compatibility()` (Added to HybridReranker)
+```python
+def check_embedding_compatibility(self, model_id):
+    """
+    Check if current embeddings are compatible with CF model.
+    
+    Args:
+        model_id: CF model ID
+    
+    Returns:
+        dict: Compatibility status
+    """
+    from recsys.cf.registry import ModelRegistry, BERTEmbeddingsRegistry
+    import logging
+    
+    logger = logging.getLogger(__name__)
+    
+    model_registry = ModelRegistry()
+    bert_registry = BERTEmbeddingsRegistry()
+    
+    model_info = model_registry.get_model(model_id)
+    if not model_info:
+        return {'compatible': False, 'reason': 'Model not found'}
+    
+    # Check if model was trained with BERT init
+    bert_integration = model_info.get('bert_integration')
+    if not bert_integration:
+        return {'compatible': True, 'reason': 'Model not using BERT embeddings'}
+    
+    # Check linked embeddings
+    model_embedding_version = bert_integration.get('embedding_version')
+    current_embedding_version = self.embedding_version
+    
+    if not current_embedding_version:
+        logger.warning("No embedding version tracked, cannot check compatibility")
+        return {'compatible': None, 'reason': 'Embedding version not available'}
+    
+    if model_embedding_version == current_embedding_version:
+        return {'compatible': True, 'reason': 'Exact version match'}
+    
+    # Check if embeddings are linked to model
+    embedding_info = bert_registry.get_embeddings(current_embedding_version)
+    if embedding_info and model_id in embedding_info.get('linked_models', []):
+        return {'compatible': True, 'reason': 'Linked to model'}
+    
+    return {
+        'compatible': False,
+        'reason': f'Version mismatch: model uses {model_embedding_version}, current is {current_embedding_version}'
+    }
+```
+
+## Component 9: Use Cases
 
 ### Use Case 1: Personalized Recommendations
 ```python
@@ -1009,8 +1279,10 @@ config = {
 - `evaluate_hybrid_model()`: CF vs CF+BERT comparison framework
 
 **Task 04 (Model Registry)**:
-- BERT embedding artifact tracking with version compatibility
-- `load_model_with_embeddings()`: Atomic loading of CF model + BERT embeddings
+- `BERTEmbeddingsRegistry`: Centralized BERT embeddings versioning
+- `load_bert_embeddings()`: Load embeddings from registry by version
+- Link embeddings to CF models for compatibility tracking
+- Embedding freshness monitoring
 
 **Task 05 (Serving Layer)**:
 - `PhoBERTEmbeddingLoader`: Production-ready BERT loader with LRU caching
@@ -1018,32 +1290,46 @@ config = {
 - `compute_user_profile()`: Aggregate user history into BERT space
 
 **Task 06 (Monitoring)**:
-- `check_embedding_freshness()`: Alert if BERT embeddings stale
+- `check_embedding_freshness()`: Alert if BERT embeddings stale (uses registry)
 - `detect_semantic_drift()`: Compare embedding versions via cosine similarity
+- Registry health checks include BERT embedding freshness
 
 **Task 07 (Automation)**:
 - `refresh_bert_embeddings.py`: Weekly regeneration of product embeddings
+- Auto-register embeddings in BERTEmbeddingsRegistry after generation
+- Auto-set as current best if first or improved
 - Cron job: Tuesday 3am BERT refresh, aligned with model training schedule
+- Link embeddings to CF models after training
 
 **Task 08 (This Task)**:
 - `HybridReranker`: Weighted combination of CF + BERT + metadata signals
+- `PhoBERTEmbeddings`: Registry-integrated embedding loader
+- Hot-reload embeddings from registry without service restart
+- Embedding-model compatibility checking
 - Diversity penalty using BERT similarity thresholds
 - End-to-end integration of all previous components
 
 ## Timeline Estimate
 
 - **PhoBERT loader refactoring**: 0.5 day (already in Task 05)
+- **Registry integration**: 0.5 day (BERTEmbeddingsRegistry)
 - **HybridReranker implementation**: 1 day
 - **Signal computation methods**: 1 day
 - **Diversity penalty logic**: 0.5 day
+- **Hot-reload embeddings**: 0.5 day
+- **Compatibility checking**: 0.5 day
 - **Configuration tuning**: 1 day (using Task 03 metrics)
 - **Testing và validation**: 1 day
 - **Documentation updates**: 0.5 day
-- **Total**: ~5.5 days (excluding Task 05 work already done)
+- **Total**: ~6.5 days (excluding Task 05 work already done)
 
 ## Success Criteria
 
 - [ ] HybridReranker integrated with PhoBERTEmbeddingLoader (Task 05)
+- [ ] BERT embeddings loaded from BERTEmbeddingsRegistry (Task 04)
+- [ ] Embedding version tracked in reranking metadata
+- [ ] Hot-reload embeddings without service restart
+- [ ] Embedding-model compatibility checking implemented
 - [ ] Weighted score combination implemented
 - [ ] Diversity penalty reduces BERT similarity clustering
 - [ ] Semantic alignment (Task 03) > 0.7 for hybrid recommendations
@@ -1051,28 +1337,8 @@ config = {
 - [ ] Cold-start coverage (Task 03) increases with content signals
 - [ ] Configuration examples tested across user segments
 - [ ] Integration with monitoring (Task 06) for embedding freshness
-- [ ] Automation (Task 07) ensures weekly BERT updates
+- [ ] Automation (Task 07) ensures weekly BERT updates with registry
+- [ ] Hot-reload embeddings works without service restart
+- [ ] Embedding-model compatibility checking functional
+- [ ] Embedding version tracked in all recommendations
 - [ ] Documentation complete with cross-task references
-torch>=1.13.0  # PhoBERT embeddings
-transformers>=4.25.0  # PhoBERT model (nếu cần encode mới)
-```
-
-## Timeline Estimate
-
-- **PhoBERT integration**: 1 day
-- **Reranker implementation**: 2 days
-- **Attribute filtering**: 1 day
-- **Configuration**: 0.5 day
-- **Evaluation**: 1 day
-- **Testing**: 1 day
-- **Total**: ~6.5 days
-
-## Success Criteria
-
-- [ ] Hybrid reranking combines CF + content + popularity
-- [ ] Diversity metric improves vs pure CF
-- [ ] Cold-start performance improves
-- [ ] Attribute filtering works
-- [ ] Configuration flexible (tunable weights)
-- [ ] Latency acceptable (<200ms per request)
-- [ ] Evaluation shows improvement in diversity + coverage

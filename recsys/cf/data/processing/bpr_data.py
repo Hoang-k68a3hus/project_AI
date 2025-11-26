@@ -9,6 +9,12 @@ Key Features:
 - Hard Negative Strategy 1: Explicit negatives (rating <= 3)
 - Hard Negative Strategy 2: Implicit negatives from popularity (Top-50 items NOT bought)
 - Sampling: 30% hard negatives + 70% random negatives
+- Sentiment-aware confidence scoring for weighted BPR training
+
+Sentiment-Aware Enhancement:
+- Uses confidence_score (rating + comment_quality) to weight triplets
+- Higher weight for genuine positive reviews (high sentiment score)
+- Lower weight for suspicious reviews (rating/sentiment mismatch)
 """
 
 import logging
@@ -744,3 +750,315 @@ class BPRDataPreparer:
             'num_items': num_items,
             'stats': stats
         }
+    
+    # ========================================================================
+    # Sentiment-Aware BPR Methods (Enhanced for fake review detection)
+    # ========================================================================
+    
+    def build_positive_pairs_with_confidence(
+        self,
+        interactions_df: pd.DataFrame,
+        user_col: str = 'u_idx',
+        item_col: str = 'i_idx',
+        confidence_col: str = 'confidence_score'
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[str, Any]]:
+        """
+        Build positive pairs with associated confidence scores for sentiment-aware BPR.
+        
+        This method extracts positive pairs along with their confidence scores
+        (rating + comment_quality) for weighted BPR training. Higher confidence
+        means the review is more trustworthy (genuine positive vs spam/fake).
+        
+        Confidence Score Range:
+        - Min: 1.0 (rating 1 + quality 0)
+        - Max: 6.0 (rating 5 + quality 1)
+        - Threshold: >= 4.5 for "trusted" positives (rating 4 + quality 0.5)
+        
+        Args:
+            interactions_df: DataFrame with 'is_positive' and 'confidence_score' columns
+            user_col: User index column
+            item_col: Item index column
+            confidence_col: Confidence score column (rating + comment_quality)
+        
+        Returns:
+            Tuple[np.ndarray, np.ndarray, Dict]:
+                - pairs: Array of shape (N, 2) with [u_idx, i_idx]
+                - confidence_scores: Array of shape (N,) with confidence values
+                - stats: Statistics dictionary including confidence distribution
+        
+        Example:
+            >>> preparer = BPRDataPreparer()
+            >>> pairs, scores, stats = preparer.build_positive_pairs_with_confidence(df)
+            >>> print(f"Positive pairs: {len(pairs):,}")
+            >>> print(f"Mean confidence: {stats['confidence_mean']:.3f}")
+            >>> print(f"High confidence ratio: {stats['high_confidence_ratio']:.2%}")
+        """
+        logger.info("\n" + "="*80)
+        logger.info("STEP 1.2+: BUILD SENTIMENT-AWARE BPR POSITIVE PAIRS")
+        logger.info("="*80)
+        
+        # Check for required columns
+        if 'is_positive' not in interactions_df.columns:
+            logger.info("Creating is_positive column...")
+            if 'rating' in interactions_df.columns:
+                interactions_df = self.create_positive_labels(interactions_df)
+            else:
+                raise ValueError("DataFrame must have 'is_positive' or 'rating' column")
+        
+        if confidence_col not in interactions_df.columns:
+            logger.warning(
+                f"Column '{confidence_col}' not found. "
+                f"Using rating as confidence score (no sentiment enhancement)."
+            )
+            confidence_col = 'rating'
+        
+        # Filter to positive interactions
+        positive_df = interactions_df[interactions_df['is_positive'] == 1].copy()
+        
+        # Extract pairs and confidence scores
+        users = positive_df[user_col].values
+        items = positive_df[item_col].values
+        confidence_scores = positive_df[confidence_col].values.astype(np.float32)
+        
+        pairs = np.column_stack([users, items])
+        
+        # Compute statistics
+        num_pairs = len(pairs)
+        num_unique_users = len(np.unique(users))
+        num_unique_items = len(np.unique(items))
+        avg_pairs_per_user = num_pairs / num_unique_users if num_unique_users > 0 else 0
+        
+        # Confidence distribution stats
+        confidence_mean = float(confidence_scores.mean())
+        confidence_std = float(confidence_scores.std())
+        confidence_min = float(confidence_scores.min())
+        confidence_max = float(confidence_scores.max())
+        
+        # High confidence threshold (rating 4 + quality 0.5 = 4.5)
+        high_confidence_threshold = 4.5
+        high_confidence_count = (confidence_scores >= high_confidence_threshold).sum()
+        high_confidence_ratio = high_confidence_count / num_pairs if num_pairs > 0 else 0
+        
+        # Suspicious reviews (high rating but low confidence)
+        # e.g., rating 5 but confidence < 5.3 means comment_quality < 0.3
+        suspicious_threshold = 5.3
+        suspicious_count = (
+            (positive_df['rating'] == 5) & 
+            (confidence_scores < suspicious_threshold)
+        ).sum() if 'rating' in positive_df.columns else 0
+        suspicious_ratio = suspicious_count / num_pairs if num_pairs > 0 else 0
+        
+        stats = {
+            'num_pairs': num_pairs,
+            'num_unique_users': num_unique_users,
+            'num_unique_items': num_unique_items,
+            'avg_pairs_per_user': avg_pairs_per_user,
+            'positive_threshold': self.positive_threshold,
+            'pair_shape': pairs.shape,
+            # Confidence stats
+            'confidence_col': confidence_col,
+            'confidence_mean': confidence_mean,
+            'confidence_std': confidence_std,
+            'confidence_min': confidence_min,
+            'confidence_max': confidence_max,
+            'confidence_p25': float(np.percentile(confidence_scores, 25)),
+            'confidence_p50': float(np.percentile(confidence_scores, 50)),
+            'confidence_p75': float(np.percentile(confidence_scores, 75)),
+            'high_confidence_threshold': high_confidence_threshold,
+            'high_confidence_count': int(high_confidence_count),
+            'high_confidence_ratio': high_confidence_ratio,
+            'suspicious_count': int(suspicious_count),
+            'suspicious_ratio': suspicious_ratio
+        }
+        
+        logger.info(f"Positive pairs:           {num_pairs:,}")
+        logger.info(f"Unique users:             {num_unique_users:,}")
+        logger.info(f"Unique items:             {num_unique_items:,}")
+        logger.info(f"Avg pairs per user:       {avg_pairs_per_user:.2f}")
+        logger.info("\nConfidence Score Distribution:")
+        logger.info(f"  Min:    {confidence_min:.3f}")
+        logger.info(f"  Mean:   {confidence_mean:.3f}")
+        logger.info(f"  Max:    {confidence_max:.3f}")
+        logger.info(f"  Std:    {confidence_std:.3f}")
+        logger.info(f"\nSentiment Quality Analysis:")
+        logger.info(f"  High confidence (>={high_confidence_threshold}): {high_confidence_count:,} ({high_confidence_ratio:.2%})")
+        logger.info(f"  Suspicious reviews:      {suspicious_count:,} ({suspicious_ratio:.2%})")
+        logger.info("✓ Sentiment-aware positive pairs built")
+        
+        return pairs, confidence_scores, stats
+    
+    def get_bpr_training_data_with_confidence(
+        self,
+        interactions_df: pd.DataFrame,
+        products_df: Optional[pd.DataFrame] = None,
+        user_col: str = 'u_idx',
+        item_col: str = 'i_idx',
+        rating_col: str = 'rating',
+        confidence_col: str = 'confidence_score'
+    ) -> Dict[str, Any]:
+        """
+        Get complete BPR training data with sentiment-aware confidence scores.
+        
+        This is the enhanced version of get_bpr_training_data() that includes
+        confidence scores for weighted BPR training. Use this for BERT-Enhanced
+        BPR with sentiment-aware training.
+        
+        Pipeline:
+        1. Create positive labels
+        2. Build positive sets
+        3. Build positive pairs WITH confidence scores
+        4. Mine hard negatives (explicit + implicit)
+        5. Return data with confidence for weighted training
+        
+        Args:
+            interactions_df: DataFrame with user-item interactions
+            products_df: Optional product metadata for implicit negative mining
+            user_col: User index column
+            item_col: Item index column
+            rating_col: Rating column
+            confidence_col: Confidence score column (rating + comment_quality)
+        
+        Returns:
+            Dict containing:
+                - 'positive_pairs': np.ndarray of shape (N, 2)
+                - 'confidence_scores': np.ndarray of shape (N,) - for weighted training
+                - 'user_pos_sets': Dict[u_idx, Set[i_idx]]
+                - 'hard_neg_sets': Dict[u_idx, Set[i_idx]]
+                - 'num_users': Total number of users
+                - 'num_items': Total number of items
+                - 'stats': Comprehensive statistics including confidence distribution
+        
+        Example:
+            >>> data = preparer.get_bpr_training_data_with_confidence(train_df, products_df)
+            >>> print(f"Positive pairs: {len(data['positive_pairs']):,}")
+            >>> print(f"Mean confidence: {data['stats']['confidence_mean']:.3f}")
+            >>> 
+            >>> # Use with BERT-Enhanced BPR
+            >>> model = BERTEnhancedBPR(bert_embeddings_path=...)
+            >>> model.fit(
+            ...     positive_pairs=data['positive_pairs'],
+            ...     confidence_scores=data['confidence_scores'],
+            ...     ...
+            ... )
+        """
+        logger.info("\n" + "="*80)
+        logger.info("BPR DATA PREPARATION - SENTIMENT-AWARE PIPELINE")
+        logger.info("="*80)
+        
+        # Step 1: Create positive labels
+        df_labeled = self.create_positive_labels(interactions_df.copy(), rating_col)
+        
+        # Step 2: Build positive sets
+        user_pos_sets = self.build_positive_sets(
+            df_labeled, user_col, item_col
+        )
+        
+        # Step 3: Build positive pairs WITH confidence scores
+        positive_pairs, confidence_scores, pairs_stats = self.build_positive_pairs_with_confidence(
+            df_labeled, user_col, item_col, confidence_col
+        )
+        
+        # Step 4: Mine hard negatives
+        _, hard_neg_sets = self.mine_hard_negatives(
+            df_labeled, products_df, rating_col, user_col, item_col
+        )
+        
+        # Compute comprehensive statistics
+        num_users = df_labeled[user_col].nunique()
+        num_items = df_labeled[item_col].nunique()
+        
+        stats = {
+            'num_users': num_users,
+            'num_items': num_items,
+            'num_positive_pairs': len(positive_pairs),
+            'num_users_with_positives': len(user_pos_sets),
+            'num_users_with_hard_negatives': len(hard_neg_sets),
+            'avg_positives_per_user': pairs_stats['avg_pairs_per_user'],
+            'avg_hard_negatives_per_user': (
+                sum(len(s) for s in hard_neg_sets.values()) / len(hard_neg_sets)
+                if hard_neg_sets else 0
+            ),
+            'positive_threshold': self.positive_threshold,
+            'hard_negative_threshold': self.hard_negative_threshold,
+            'hard_negative_ratio': self.hard_negative_ratio,
+            'top_k_popular': self.top_k_popular,
+            # Confidence stats from pairs_stats
+            'confidence_col': pairs_stats.get('confidence_col', confidence_col),
+            'confidence_mean': pairs_stats.get('confidence_mean'),
+            'confidence_std': pairs_stats.get('confidence_std'),
+            'confidence_min': pairs_stats.get('confidence_min'),
+            'confidence_max': pairs_stats.get('confidence_max'),
+            'high_confidence_ratio': pairs_stats.get('high_confidence_ratio'),
+            'suspicious_ratio': pairs_stats.get('suspicious_ratio'),
+        }
+        
+        logger.info("\n" + "-"*80)
+        logger.info("SENTIMENT-AWARE BPR DATA PREPARATION COMPLETE")
+        logger.info("-"*80)
+        logger.info(f"Users: {num_users:,}, Items: {num_items:,}")
+        logger.info(f"Positive pairs: {len(positive_pairs):,}")
+        logger.info(f"Mean confidence: {stats['confidence_mean']:.3f}")
+        logger.info(f"High confidence ratio: {stats['high_confidence_ratio']:.2%}")
+        logger.info(f"Suspicious review ratio: {stats['suspicious_ratio']:.2%}")
+        logger.info("-"*80)
+        
+        return {
+            'positive_pairs': positive_pairs,
+            'confidence_scores': confidence_scores,
+            'user_pos_sets': user_pos_sets,
+            'hard_neg_sets': hard_neg_sets,
+            'num_users': num_users,
+            'num_items': num_items,
+            'stats': stats
+        }
+    
+    def compute_confidence_weighted_stats(
+        self,
+        confidence_scores: np.ndarray,
+        threshold_low: float = 4.0,
+        threshold_high: float = 5.0
+    ) -> Dict[str, Any]:
+        """
+        Compute detailed statistics about confidence score distribution.
+        
+        Useful for understanding the quality of reviews in the dataset
+        and tuning the sentiment-aware weighting parameters.
+        
+        Args:
+            confidence_scores: Array of confidence scores
+            threshold_low: Lower threshold for "medium confidence"
+            threshold_high: Upper threshold for "high confidence"
+        
+        Returns:
+            Dictionary with detailed confidence distribution statistics
+        """
+        total = len(confidence_scores)
+        
+        low_conf = (confidence_scores < threshold_low).sum()
+        medium_conf = ((confidence_scores >= threshold_low) & 
+                       (confidence_scores < threshold_high)).sum()
+        high_conf = (confidence_scores >= threshold_high).sum()
+        
+        return {
+            'total_samples': total,
+            'threshold_low': threshold_low,
+            'threshold_high': threshold_high,
+            'low_confidence_count': int(low_conf),
+            'low_confidence_pct': low_conf / total if total > 0 else 0,
+            'medium_confidence_count': int(medium_conf),
+            'medium_confidence_pct': medium_conf / total if total > 0 else 0,
+            'high_confidence_count': int(high_conf),
+            'high_confidence_pct': high_conf / total if total > 0 else 0,
+            'mean': float(confidence_scores.mean()),
+            'std': float(confidence_scores.std()),
+            'min': float(confidence_scores.min()),
+            'max': float(confidence_scores.max()),
+            'percentiles': {
+                'p10': float(np.percentile(confidence_scores, 10)),
+                'p25': float(np.percentile(confidence_scores, 25)),
+                'p50': float(np.percentile(confidence_scores, 50)),
+                'p75': float(np.percentile(confidence_scores, 75)),
+                'p90': float(np.percentile(confidence_scores, 90)),
+            }
+        }
+

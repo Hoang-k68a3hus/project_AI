@@ -222,9 +222,19 @@ class ModelComparator:
         
         # Compute pooled standard deviation
         n1, n2 = len(model_values), len(baseline_values)
+        
+        # Check for minimum sample size
+        if n1 < 2 or n2 < 2:
+            return {'d': np.nan, 'interpretation': 'N/A', 'warning': 'Insufficient sample size'}
+        
         s1, s2 = np.std(model_values, ddof=1), np.std(baseline_values, ddof=1)
         
-        pooled_std = np.sqrt(((n1 - 1) * s1**2 + (n2 - 1) * s2**2) / (n1 + n2 - 2))
+        # Avoid division by zero
+        degrees_of_freedom = n1 + n2 - 2
+        if degrees_of_freedom <= 0:
+            return {'d': np.nan, 'interpretation': 'N/A', 'warning': 'Invalid degrees of freedom'}
+        
+        pooled_std = np.sqrt(((n1 - 1) * s1**2 + (n2 - 1) * s2**2) / degrees_of_freedom)
         
         if pooled_std == 0:
             return {'d': np.nan, 'interpretation': 'N/A'}

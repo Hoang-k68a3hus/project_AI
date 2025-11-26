@@ -4,20 +4,67 @@
 
 Xây dựng module đánh giá toàn diện cho Collaborative Filtering, bao gồm metrics chuẩn RecSys, baseline comparisons, và statistical significance testing. Module này được chia sẻ giữa ALS và BPR pipelines.
 
+## Module Architecture Overview
+
+Code đã được tổ chức thành **class-based architecture** với các modules riêng biệt:
+
+```
+recsys/cf/evaluation/
+├── __init__.py              # Package exports
+├── metrics.py               # Core metrics (Recall, NDCG, Precision, MRR, MAP, Coverage)
+├── model_evaluator.py       # ModelEvaluator, BatchModelEvaluator
+├── baseline_evaluator.py    # PopularityBaseline, RandomBaseline, ItemSimilarityBaseline
+├── hybrid_metrics.py        # Diversity, SemanticAlignment, ColdStartCoverage, Novelty
+├── comparison.py            # ModelComparator, ReportGenerator, EvaluationVisualizer
+└── statistical_tests.py    # StatisticalTester, BootstrapEstimator
+```
+
 ## Module Structure
 
-### Module: `recsys/cf/metrics.py`
+### Package: `recsys/cf/evaluation`
 
-#### Exported Functions
-1. `recall_at_k(predictions, ground_truth, k)` → float
-2. `ndcg_at_k(predictions, ground_truth, k)` → float
-3. `precision_at_k(predictions, ground_truth, k)` → float
-4. `mrr(predictions, ground_truth)` → float
-5. `map_at_k(predictions, ground_truth, k)` → float
-6. `coverage(predictions, num_total_items)` → float
-7. `evaluate_model(U, V, test_data, user_pos_train, k_values)` → dict
-8. `evaluate_baseline_popularity(test_data, item_popularity, k_values)` → dict
-9. `compare_models(model_metrics, baseline_metrics)` → DataFrame
+#### Core Exports
+
+**Core Metrics** (`metrics.py`):
+- `BaseMetric`: Abstract base class for all metrics
+- `RecallAtK`, `PrecisionAtK`, `NDCGAtK`, `MRR`, `MAPAtK`, `HitRate`: Ranking metrics
+- `Coverage`: Catalog coverage metric
+- `MetricFactory`: Factory for creating standard metric sets
+- Convenience functions: `recall_at_k()`, `ndcg_at_k()`, `precision_at_k()`, `mrr()`, `map_at_k()`, `coverage()`
+
+**Model Evaluator** (`model_evaluator.py`):
+- `ModelEvaluator`: Main class for evaluating CF models (ALS, BPR)
+- `BatchModelEvaluator`: Evaluate and compare multiple models simultaneously
+- Convenience functions: `evaluate_model()`, `load_and_evaluate()`
+
+**Baseline Evaluators** (`baseline_evaluator.py`):
+- `BaselineRecommender`: Abstract base class
+- `PopularityBaseline`: Popularity-based recommendations
+- `RandomBaseline`: Random recommendations
+- `ItemSimilarityBaseline`: Content-based similarity baseline
+- `BaselineComparator`: Compare baselines
+- Convenience functions: `evaluate_baseline_popularity()`, `evaluate_baseline_random()`
+
+**Hybrid Metrics** (`hybrid_metrics.py`):
+- `HybridMetric`: Abstract base class
+- `DiversityMetric`: Intra-list diversity using embeddings
+- `SemanticAlignmentMetric`: Alignment with user content profile
+- `ColdStartCoverageMetric`: Coverage of cold-start items
+- `NoveltyMetric`: Recommendation novelty (long-tail items)
+- `SerendipityMetric`: Serendipity score (surprising yet relevant)
+- `HybridMetricCollection`: Collection of hybrid metrics for batch evaluation
+- Convenience functions: `compute_diversity_bert()`, `compute_semantic_alignment()`, `compute_cold_start_coverage()`
+
+**Comparison & Reporting** (`comparison.py`):
+- `ModelComparator`: Statistical comparison of models
+- `ReportGenerator`: Generate CSV/JSON/Markdown reports
+- `EvaluationVisualizer`: Prepare data for visualizations
+- Convenience functions: `compare_models()`, `generate_evaluation_report()`
+
+**Statistical Testing** (`statistical_tests.py`):
+- `StatisticalTester`: Paired t-tests, Wilcoxon, Cohen's d, multiple comparisons
+- `BootstrapEstimator`: Bootstrap confidence intervals, permutation tests
+- Convenience functions: `paired_t_test()`, `cohens_d()`
 
 ## Core Metrics
 
@@ -31,15 +78,33 @@ Xây dựng module đánh giá toàn diện cho Collaborative Filtering, bao g�
 Recall@K = |Top-K ∩ Test_Items| / |Test_Items|
 ```
 
+#### Implementation
+- **Module**: `recsys/cf/evaluation/metrics.py`
+- **Class**: `RecallAtK(BaseMetric)`
+- **Method**: `compute(predictions, ground_truth, k=None)`
+
+**Usage**:
+```python
+from recsys.cf.evaluation import RecallAtK, recall_at_k
+
+# Method 1: Using class
+metric = RecallAtK(k=10)
+score = metric.compute(predictions=[1, 5, 3, 8, 2], ground_truth={3, 8, 10})
+
+# Method 2: Convenience function
+score = recall_at_k(predictions=[1, 5, 3, 8, 2], ground_truth={3, 8, 10}, k=10)
+```
+
 #### Implementation Details
 - **Input**:
-  - `predictions`: List of K item IDs (recommended)
-  - `ground_truth`: Set of positive item IDs (test)
-  - `k`: Integer cutoff
+  - `predictions`: List/array of item indices (recommended)
+  - `ground_truth`: Set of positive item indices (test)
+  - `k`: Integer cutoff (optional, uses class default if not provided)
 - **Output**: Float [0, 1]
 - **Edge cases**:
-  - Nếu `|Test_Items| = 0` → skip user (hoặc return NaN)
+  - Nếu `|Test_Items| = 0` → return 0.0 (no relevant items to find)
   - Nếu `K > num_predictions` → use len(predictions)
+  - Input validation via `BaseMetric.validate_inputs()`
 
 #### Interpretation
 - **Recall@10 = 0.25**: 25% test items được tìm thấy trong top-10
@@ -58,16 +123,34 @@ IDCG@K = DCG@K của perfect ranking (all relevant items first)
 NDCG@K = DCG@K / IDCG@K
 ```
 
+#### Implementation
+- **Module**: `recsys/cf/evaluation/metrics.py`
+- **Class**: `NDCGAtK(BaseMetric)`
+- **Method**: `compute(predictions, ground_truth, k=None)`
+
+**Usage**:
+```python
+from recsys.cf.evaluation import NDCGAtK, ndcg_at_k
+
+# Method 1: Using class
+metric = NDCGAtK(k=10)
+score = metric.compute(predictions=[1, 5, 3, 8, 2], ground_truth={3, 8, 10})
+
+# Method 2: Convenience function
+score = ndcg_at_k(predictions=[1, 5, 3, 8, 2], ground_truth={3, 8, 10}, k=10)
+```
+
 #### Relevance Definition
 - **Binary**: rel_i = 1 nếu item_i in test positives, else 0
-- **Graded** (optional): rel_i = rating (1-5) nếu có explicit ratings
+- **Graded** (optional): rel_i = rating (1-5) nếu có explicit ratings (not implemented in current version)
 
 #### Implementation Details
 - **Discounting**: `log2(position + 1)` → vị trí 1,2,3,... có weight 1.0, 0.63, 0.5, ...
 - **Normalization**: Divide bằng IDCG (ideal DCG) để scale [0, 1]
 - **Edge cases**:
   - Nếu không có relevant items trong top-K → DCG = 0, NDCG = 0
-  - Nếu IDCG = 0 (no test positives) → skip user
+  - Nếu IDCG = 0 (no test positives) → return 0.0
+  - Input validation via `BaseMetric.validate_inputs()`
 
 #### Interpretation
 - **NDCG@10 = 0.18**: Ranking quality = 18% của ideal ranking
@@ -82,6 +165,23 @@ NDCG@K = DCG@K / IDCG@K
 #### Formula
 ```
 Precision@K = |Top-K ∩ Test_Items| / K
+```
+
+#### Implementation
+- **Module**: `recsys/cf/evaluation/metrics.py`
+- **Class**: `PrecisionAtK(BaseMetric)`
+- **Method**: `compute(predictions, ground_truth, k=None)`
+
+**Usage**:
+```python
+from recsys.cf/evaluation import PrecisionAtK, precision_at_k
+
+# Method 1: Using class
+metric = PrecisionAtK(k=10)
+score = metric.compute(predictions=[1, 5, 3, 8, 2], ground_truth={3, 8, 10})
+
+# Method 2: Convenience function
+score = precision_at_k(predictions=[1, 5, 3, 8, 2], ground_truth={3, 8, 10}, k=10)
 ```
 
 #### Characteristics
@@ -101,9 +201,26 @@ MRR = Average(RR_u) across all users
 ```
 
 #### Implementation
+- **Module**: `recsys/cf/evaluation/metrics.py`
+- **Class**: `MRR(BaseMetric)`
+- **Method**: `compute(predictions, ground_truth)`
+
+**Usage**:
+```python
+from recsys.cf.evaluation import MRR, mrr
+
+# Method 1: Using class
+metric = MRR()
+score = metric.compute(predictions=[1, 5, 3, 8, 2], ground_truth={3, 8, 10})
+
+# Method 2: Convenience function
+score = mrr(predictions=[1, 5, 3, 8, 2], ground_truth={3, 8, 10})
+```
+
+#### Implementation Details
 - **Find rank**: Vị trí (1-indexed) của test item đầu tiên trong predictions
 - **Reciprocal**: 1/rank → rank 1 = 1.0, rank 2 = 0.5, rank 10 = 0.1
-- **Average**: Across users
+- **Average**: Across users (computed in `ModelEvaluator`)
 
 #### Use Case
 - **Search/QA systems**: User chỉ quan tâm item đầu tiên relevant
@@ -121,6 +238,23 @@ MAP@K = Average(AP@K) across users
 ```
 Trong đó `Rel_K` = relevant items trong top-K
 
+#### Implementation
+- **Module**: `recsys/cf/evaluation/metrics.py`
+- **Class**: `MAPAtK(BaseMetric)`
+- **Method**: `compute(predictions, ground_truth, k=None)`
+
+**Usage**:
+```python
+from recsys.cf.evaluation import MAPAtK, map_at_k
+
+# Method 1: Using class
+metric = MAPAtK(k=10)
+score = metric.compute(predictions=[1, 5, 3, 8, 2], ground_truth={3, 8, 10})
+
+# Method 2: Convenience function
+score = map_at_k(predictions=[1, 5, 3, 8, 2], ground_truth={3, 8, 10}, k=10)
+```
+
 #### Interpretation
 - **Combines**: Precision và ranking quality
 - **Stricter than Recall**: Penalizes relevant items ở vị trí thấp
@@ -134,6 +268,29 @@ Trong đó `Rel_K` = relevant items trong top-K
 #### Formula
 ```
 Coverage = |Unique Items in All Recommendations| / |Total Items|
+```
+
+#### Implementation
+- **Module**: `recsys/cf/evaluation/metrics.py`
+- **Class**: `Coverage(BaseMetric)`
+- **Method**: `compute(recommendations, num_total_items)`
+
+**Usage**:
+```python
+from recsys.cf.evaluation import Coverage, coverage
+
+# Method 1: Using class
+metric = Coverage()
+score = metric.compute(
+    recommendations={0: [1, 5, 3], 1: [2, 5, 8], 2: [3, 7, 9]},
+    num_total_items=100
+)
+
+# Method 2: Convenience function
+score = coverage(
+    recommendations={0: [1, 5, 3], 1: [2, 5, 8], 2: [3, 7, 9]},
+    num_total_items=100
+)
 ```
 
 #### Purpose
@@ -150,8 +307,40 @@ Coverage = |Unique Items in All Recommendations| / |Total Items|
 
 ### 1. Popularity Baseline
 
+#### Implementation
+- **Module**: `recsys/cf/evaluation/baseline_evaluator.py`
+- **Class**: `PopularityBaseline(BaselineRecommender)`
+- **Methods**:
+  - `recommend(user_idx, k, exclude_items)`: Generate recommendations for single user
+  - `recommend_batch(user_indices, k, user_exclude_items)`: Batch recommendations
+  - `evaluate(test_data, user_pos_train, k_values)`: Full evaluation
+
+**Usage**:
+```python
+from recsys.cf.evaluation import PopularityBaseline, evaluate_baseline_popularity
+
+# Method 1: Using class
+baseline = PopularityBaseline(
+    item_popularity=item_popularity,  # Array from Task 01
+    num_items=2231
+)
+results = baseline.evaluate(
+    test_data=test_data,
+    user_pos_train=user_pos_train,
+    k_values=[10, 20]
+)
+
+# Method 2: Convenience function
+results = evaluate_baseline_popularity(
+    test_data=test_data,
+    item_popularity=item_popularity,
+    user_pos_train=user_pos_train,
+    k_values=[10, 20]
+)
+```
+
 #### Method 1: Training Frequency
-- **Source**: `item_popularity` array từ Task 01
+- **Source**: `item_popularity` array từ Task 01 (log-transformed interaction counts)
 - **Logic**: Rank items theo số lần xuất hiện trong train data
 - **Pros**: Simple, data-driven
 - **Cons**: Không personalized
@@ -161,17 +350,11 @@ Coverage = |Unique Items in All Recommendations| / |Total Items|
 - **Logic**: Rank items theo số lượng đã bán (external signal)
 - **Pros**: Reflects real-world popularity
 - **Cons**: Có thể stale (data cũ)
+- **Note**: Can be implemented by passing `num_sold_time` as `item_popularity`
 
 #### Recommendation Logic
-```python
-def popularity_recommendations(test_users, item_popularity, k):
-    # Rank items by popularity
-    top_k_items = argsort(item_popularity)[::-1][:k]
-    
-    # Same recommendations for all users
-    recommendations = {u: top_k_items for u in test_users}
-    return recommendations
-```
+- **Same recommendations for all users**: Top-K popular items (excluding seen items)
+- **Efficient**: Pre-compute ranked list once, filter per user
 
 #### Expected Performance
 - **Recall@10**: 0.12 - 0.15
@@ -180,105 +363,271 @@ def popularity_recommendations(test_users, item_popularity, k):
 
 ### 2. Random Baseline
 
+#### Implementation
+- **Module**: `recsys/cf/evaluation/baseline_evaluator.py`
+- **Class**: `RandomBaseline(BaselineRecommender)`
+- **Method**: `recommend(user_idx, k, exclude_items)`: Random sampling
+
+**Usage**:
+```python
+from recsys.cf.evaluation import RandomBaseline, evaluate_baseline_random
+
+# Method 1: Using class
+baseline = RandomBaseline(num_items=2231, random_seed=42)
+results = baseline.evaluate(test_data, user_pos_train, k_values=[10, 20])
+
+# Method 2: Convenience function
+results = evaluate_baseline_random(
+    test_data=test_data,
+    num_items=2231,
+    user_pos_train=user_pos_train,
+    k_values=[10, 20],
+    random_seed=42
+)
+```
+
 #### Method
 - **Logic**: Sample K items uniformly random (exclude seen)
 - **Purpose**: Lower bound sanity check
+- **Reproducible**: Uses random seed for consistency
 
 #### Expected Performance
 - **Recall@10**: ~0.01 (very low)
 - **NDCG@10**: ~0.005
 
-### 3. Comparison Metrics
+### 3. Item Similarity Baseline (Content-Based)
+
+#### Implementation
+- **Module**: `recsys/cf/evaluation/baseline_evaluator.py`
+- **Class**: `ItemSimilarityBaseline(BaselineRecommender)`
+- **Method**: Uses item-item similarity matrix (e.g., from BERT embeddings)
+
+**Usage**:
+```python
+from recsys.cf.evaluation import ItemSimilarityBaseline
+
+# Requires similarity matrix (e.g., from BERT embeddings)
+similarity_matrix = compute_item_similarity(bert_embeddings)  # (num_items, num_items)
+
+baseline = ItemSimilarityBaseline(
+    similarity_matrix=similarity_matrix,
+    num_items=2231
+)
+results = baseline.evaluate(test_data, user_pos_train, k_values=[10, 20])
+```
+
+### 4. Comparison Metrics
 
 #### Improvement Percentage
 ```
 Improvement = (CF_Metric - Baseline_Metric) / Baseline_Metric * 100%
 ```
 
+#### Implementation
+- **Module**: `recsys/cf/evaluation/comparison.py`
+- **Class**: `ModelComparator`
+- **Method**: `compute_improvement(model_name, baseline_name, metric)`
+
+**Usage**:
+```python
+from recsys.cf.evaluation import ModelComparator
+
+comparator = ModelComparator()
+comparator.add_model_results('als', als_results)
+comparator.add_baseline_results('popularity', pop_results)
+
+improvement = comparator.compute_improvement('als', 'popularity', 'recall@10')
+print(f"Improvement: {improvement['relative_percent']:.1f}%")
+```
+
 #### Statistical Significance
-- **Test**: Paired t-test trên per-user metrics
+- **Module**: `recsys/cf/evaluation/statistical_tests.py`
+- **Class**: `StatisticalTester`
+- **Tests**: 
+  - Paired t-test: `paired_t_test(sample1, sample2)`
+  - Wilcoxon signed-rank test: `wilcoxon_test(sample1, sample2)` (non-parametric)
+  - Effect size: `cohens_d(sample1, sample2)`
 - **Null hypothesis**: CF và Baseline có cùng mean metric
 - **Threshold**: p-value < 0.05 → significant improvement
 
+**Usage**:
+```python
+from recsys.cf.evaluation import StatisticalTester
+
+tester = StatisticalTester(significance_level=0.05)
+result = tester.paired_t_test(
+    model_scores=als_per_user_recall,
+    baseline_scores=pop_per_user_recall,
+    alternative='greater'  # Test if model > baseline
+)
+
+if result['significant']:
+    print(f"Significant improvement (p={result['p_value']:.4f})")
+```
+
 ## Evaluation Workflow
 
-### Function: `evaluate_model(U, V, test_data, user_pos_train, k_values)`
+### Model Evaluator
 
-#### Step 1: Generate Recommendations
+#### Class: `ModelEvaluator`
+
+- **Module**: `recsys/cf/evaluation/model_evaluator.py`
+- **Features**:
+  - Batch recommendation generation (memory efficient)
+  - Multi-metric evaluation (Recall, NDCG, Precision, MRR, MAP)
+  - Coverage analysis
+  - Per-user metrics for analysis
+  - Efficient seen-item filtering
+  - Top-K optimization (argpartition for large K)
+
+**Usage**:
 ```python
-# For all test users
-test_users = test_data['u_idx'].unique()
-all_recommendations = {}
+from recsys.cf.evaluation import ModelEvaluator, evaluate_model
 
-for u in test_users:
-    # Compute scores
-    scores = U[u] @ V.T  # Shape: (num_items,)
-    
-    # Mask seen items
-    seen_items = user_pos_train.get(u, set())
-    scores[list(seen_items)] = -np.inf
-    
-    # Top-K
-    top_k_indices = np.argsort(scores)[::-1][:max(k_values)]
-    all_recommendations[u] = top_k_indices
+# Method 1: Using class
+evaluator = ModelEvaluator(
+    U=U,  # User embeddings (num_users, factors)
+    V=V,  # Item embeddings (num_items, factors)
+    k_values=[10, 20],
+    batch_size=1000,  # Memory optimization
+    use_argpartition=True  # O(n) vs O(n log n) for top-K
+)
+
+results = evaluator.evaluate(
+    test_data=test_data,  # DataFrame or Dict
+    user_pos_train=user_pos_train,  # Dict[u_idx, Set[i_idx]]
+    user_col='u_idx',
+    item_col='i_idx'
+)
+
+# Access results
+print(f"Recall@10: {results['recall@10']:.4f}")
+print(f"NDCG@10: {results['ndcg@10']:.4f}")
+print(f"Coverage: {results['coverage']:.4f}")
+
+# Per-user metrics
+per_user = evaluator.get_per_user_metrics()
+
+# Method 2: Convenience function
+results = evaluate_model(
+    U=U,
+    V=V,
+    test_data=test_data,
+    user_pos_train=user_pos_train,
+    k_values=[10, 20]
+)
 ```
+
+#### Batch Model Evaluator
+
+- **Class**: `BatchModelEvaluator`
+- **Purpose**: Evaluate and compare multiple models simultaneously
+- **Features**:
+  - Parallel evaluation of multiple models
+  - Consistent evaluation setup
+  - Comparison table generation
+
+**Usage**:
+```python
+from recsys.cf.evaluation import BatchModelEvaluator
+
+batch_evaluator = BatchModelEvaluator(k_values=[10, 20])
+
+# Add models
+batch_evaluator.add_model('als', U_als, V_als)
+batch_evaluator.add_model('bpr', U_bpr, V_bpr)
+
+# Evaluate all models
+results = batch_evaluator.evaluate_all(
+    test_data=test_data,
+    user_pos_train=user_pos_train
+)
+
+# Get comparison table
+comparison = batch_evaluator.get_comparison_table()
+print(comparison)
+```
+
+#### Step 1: Generate Recommendations (Batch Processing)
+- **Method**: `generate_recommendations(test_users, user_pos_train, k)`
+- **Optimization**: 
+  - Batch processing: `U[batch] @ V.T` for memory efficiency
+  - Top-K optimization: Uses `argpartition` (O(n)) instead of `argsort` (O(n log n)) when K < n/2
+  - Efficient filtering: Masks seen items with `-np.inf`
 
 #### Step 2: Prepare Ground Truth
-```python
-# Extract test positives per user
-ground_truth = {}
-for u in test_users:
-    ground_truth[u] = set(test_data[test_data['u_idx'] == u]['i_idx'])
-```
+- **Method**: `_prepare_ground_truth(test_data, user_col, item_col)`
+- **Supports**: Both DataFrame and Dict formats
+- **Output**: Dict[u_idx, Set[i_idx]]
 
 #### Step 3: Compute Metrics
-```python
-results = {}
-for k in k_values:  # e.g., [10, 20]
-    recalls = []
-    ndcgs = []
-    
-    for u in test_users:
-        pred_k = all_recommendations[u][:k]
-        gt_u = ground_truth[u]
-        
-        recalls.append(recall_at_k(pred_k, gt_u, k))
-        ndcgs.append(ndcg_at_k(pred_k, gt_u, k))
-    
-    # Average across users
-    results[f'recall@{k}'] = np.mean(recalls)
-    results[f'ndcg@{k}'] = np.mean(ndcgs)
-```
+- **Method**: `_compute_metrics(recommendations, ground_truth, k_values)`
+- **Metrics**: Uses `MetricFactory.create_standard_metrics(k_values)` to create metric instances
+- **Per-user**: Stores per-user metrics for statistical testing
 
 #### Step 4: Compute Coverage
-```python
-all_recommended_items = set()
-for recs in all_recommendations.values():
-    all_recommended_items.update(recs)
-
-results['coverage'] = len(all_recommended_items) / num_items
-```
+- **Method**: Uses `Coverage` metric class
+- **Input**: All recommendations dict
+- **Output**: Coverage score [0, 1]
 
 #### Step 5: Return Results
 ```python
-return {
+{
     'recall@10': 0.234,
     'recall@20': 0.312,
     'ndcg@10': 0.189,
     'ndcg@20': 0.221,
+    'precision@10': 0.156,
+    'mrr': 0.342,
+    'map@10': 0.178,
     'coverage': 0.287,
-    'num_users_evaluated': len(test_users)
+    'num_users_evaluated': len(test_users),
+    'evaluation_time_seconds': 12.5
 }
 ```
 
 ## Reporting & Visualization
+
+### Report Generator
+
+#### Implementation
+- **Module**: `recsys/cf/evaluation/comparison.py`
+- **Class**: `ReportGenerator`
+- **Features**:
+  - Generate CSV/JSON/Markdown reports
+  - Summary tables
+  - Comparison tables with improvements
+  - Statistical significance annotations
+
+**Usage**:
+```python
+from recsys.cf.evaluation import ReportGenerator, generate_evaluation_report
+
+# Method 1: Using class
+generator = ReportGenerator(output_dir='reports/')
+generator.add_results('als', als_results, metadata={'factors': 64, 'reg': 0.01})
+generator.add_results('bpr', bpr_results, metadata={'factors': 64, 'lr': 0.05})
+generator.add_results('popularity', pop_results, metadata={})
+
+# Generate reports
+generator.generate_csv_report('cf_eval_summary.csv')
+generator.generate_json_report('cf_eval_summary.json')
+generator.generate_markdown_report('cf_eval_summary.md')
+
+# Method 2: Convenience function
+generate_evaluation_report(
+    results={'als': als_results, 'bpr': bpr_results, 'popularity': pop_results},
+    output_path='reports/cf_eval_summary.csv',
+    format='csv'
+)
+```
 
 ### 1. Summary Table
 
 #### CSV Format: `reports/cf_eval_summary.csv`
 ```csv
 model,factors,reg,alpha,recall@10,recall@20,ndcg@10,ndcg@20,coverage,training_time
-als,64,0.01,40,0.234,0.312,0.189,0.221,0.287,45.2
+als,64,0.01,10,0.234,0.312,0.189,0.221,0.287,45.2
 bpr,64,0.0001,NA,0.242,0.321,0.195,0.228,0.301,1824.5
 popularity,NA,NA,NA,0.145,0.201,0.102,0.134,0.042,0.1
 ```
@@ -300,23 +649,57 @@ df_better = df[df['ndcg@10'] > baseline_ndcg * 1.1]  # >10% improvement
 
 ### 2. Comparison Plots
 
+#### Evaluation Visualizer
+
+- **Module**: `recsys/cf/evaluation/comparison.py`
+- **Class**: `EvaluationVisualizer`
+- **Features**: Prepare data for visualization (does not create plots, but prepares data)
+
+**Usage**:
+```python
+from recsys.cf.evaluation import EvaluationVisualizer
+
+visualizer = EvaluationVisualizer()
+
+# Prepare data for bar chart
+bar_data = visualizer.prepare_bar_chart_data(
+    results={'als': als_results, 'bpr': bpr_results, 'popularity': pop_results},
+    metrics=['recall@10', 'ndcg@10']
+)
+
+# Prepare data for K-value sensitivity
+k_sensitivity_data = visualizer.prepare_k_sensitivity_data(
+    results={'als': als_results, 'bpr': bpr_results},
+    metric='recall'
+)
+
+# Prepare data for coverage vs accuracy
+tradeoff_data = visualizer.prepare_tradeoff_data(
+    results={'als': als_results, 'bpr': bpr_results},
+    accuracy_metric='ndcg@10'
+)
+```
+
 #### Metric Bar Chart
 - **X-axis**: Models (ALS, BPR, Popularity)
 - **Y-axis**: Recall@10 / NDCG@10
 - **Visualization**: Side-by-side bars
 - **Highlight**: Best model
+- **Note**: Use `EvaluationVisualizer` to prepare data, then plot with matplotlib/seaborn
 
 #### K-Value Sensitivity
 - **X-axis**: K (5, 10, 20, 50)
 - **Y-axis**: Recall@K
 - **Lines**: ALS, BPR, Popularity
 - **Purpose**: Show recall increases với K
+- **Data preparation**: Use `prepare_k_sensitivity_data()`
 
 #### Coverage vs Accuracy Trade-off
 - **X-axis**: Coverage
 - **Y-axis**: NDCG@10
 - **Points**: Each experiment config
 - **Insight**: High accuracy models có thể low coverage
+- **Data preparation**: Use `prepare_tradeoff_data()`
 
 ### 3. Per-User Analysis (Advanced)
 
@@ -332,26 +715,63 @@ df_better = df[df['ndcg@10'] > baseline_ndcg * 1.1]  # >10% improvement
 
 ## Statistical Testing
 
+### Statistical Tester
+
+#### Implementation
+- **Module**: `recsys/cf/evaluation/statistical_tests.py`
+- **Class**: `StatisticalTester`
+- **Features**:
+  - Paired t-tests
+  - Wilcoxon signed-rank tests (non-parametric)
+  - Effect size (Cohen's d, Glass's delta)
+  - Confidence intervals
+  - Multiple comparison corrections (Bonferroni, Holm-Bonferroni)
+
+**Usage**:
+```python
+from recsys.cf.evaluation import StatisticalTester, paired_t_test, cohens_d
+
+# Method 1: Using class
+tester = StatisticalTester(significance_level=0.05)
+
+# Paired t-test
+result = tester.paired_t_test(
+    sample1=cf_per_user_recall,  # Model per-user metrics
+    sample2=baseline_per_user_recall,  # Baseline per-user metrics
+    alternative='greater'  # Test if model > baseline
+)
+
+if result['significant']:
+    print(f"Significant improvement (p={result['p_value']:.4f})")
+    print(f"Mean difference: {result['mean_diff']:.4f}")
+
+# Wilcoxon test (non-parametric, more robust)
+wilcoxon_result = tester.wilcoxon_test(
+    sample1=cf_per_user_recall,
+    sample2=baseline_per_user_recall,
+    alternative='greater'
+)
+
+# Effect size
+effect_size = tester.cohens_d(cf_per_user_recall, baseline_per_user_recall)
+print(f"Effect size (Cohen's d): {effect_size['cohens_d']:.3f}")
+
+# Method 2: Convenience functions
+result = paired_t_test(cf_per_user_recall, baseline_per_user_recall)
+d = cohens_d(cf_per_user_recall, baseline_per_user_recall)
+```
+
 ### Paired t-Test
 
 #### Hypothesis
 - **H0**: Mean difference giữa CF và Baseline = 0
-- **H1**: CF có mean metric cao hơn Baseline
+- **H1**: CF có mean metric cao hơn Baseline (one-sided) hoặc different (two-sided)
 
-#### Implementation
-```python
-from scipy.stats import ttest_rel
-
-# Per-user metrics
-cf_recalls = [recall_at_k(cf_recs[u], gt[u], 10) for u in users]
-baseline_recalls = [recall_at_k(pop_recs[u], gt[u], 10) for u in users]
-
-# Paired t-test
-t_stat, p_value = ttest_rel(cf_recalls, baseline_recalls)
-
-if p_value < 0.05:
-    print(f"CF significantly better than baseline (p={p_value:.4f})")
-```
+#### Implementation Details
+- **Test**: `scipy.stats.ttest_rel` (paired t-test)
+- **Input**: Per-user metrics from both model and baseline
+- **Output**: t-statistic, p-value, significance flag, mean difference, std difference
+- **Edge cases**: Handles small sample sizes (<3) with warnings
 
 ### Effect Size (Cohen's d)
 
@@ -360,10 +780,44 @@ if p_value < 0.05:
 d = (mean_CF - mean_Baseline) / pooled_std
 ```
 
+#### Implementation
+- **Method**: `cohens_d(sample1, sample2)`
+- **Output**: Cohen's d value and interpretation (small/medium/large)
+
 #### Interpretation
 - **d < 0.2**: Small effect
 - **d = 0.5**: Medium effect
 - **d > 0.8**: Large effect
+
+### Bootstrap Estimator
+
+#### Implementation
+- **Class**: `BootstrapEstimator`
+- **Features**:
+  - Bootstrap confidence intervals
+  - Permutation tests
+  - Non-parametric significance testing
+
+**Usage**:
+```python
+from recsys.cf.evaluation import BootstrapEstimator
+
+estimator = BootstrapEstimator(n_bootstrap=1000, random_seed=42)
+
+# Bootstrap confidence interval
+ci = estimator.bootstrap_ci(
+    sample=cf_per_user_recall,
+    confidence=0.95
+)
+print(f"95% CI: [{ci['lower']:.4f}, {ci['upper']:.4f}]")
+
+# Permutation test
+perm_result = estimator.permutation_test(
+    sample1=cf_per_user_recall,
+    sample2=baseline_per_user_recall,
+    n_permutations=1000
+)
+```
 
 ## Error Analysis
 
@@ -408,47 +862,68 @@ def inspect_user_recommendations(u_id, model, mappings, products_df, k=10):
 
 ### 1. Batch Evaluation
 
+#### Implementation
+- **Class**: `ModelEvaluator` với `batch_size` parameter
+- **Default**: `batch_size=1000` (configurable)
+- **Method**: `generate_recommendations()` processes users in batches
+
+**Usage**:
+```python
+evaluator = ModelEvaluator(
+    U=U,
+    V=V,
+    k_values=[10, 20],
+    batch_size=1000  # Process 1000 users at a time
+)
+```
+
 #### Problem
 Computing `U @ V.T` cho all users → memory explosion
 
 #### Solution
-```python
-# Evaluate in batches
-batch_size = 1000
-for i in range(0, num_users, batch_size):
-    u_batch = range(i, min(i + batch_size, num_users))
-    scores_batch = U[u_batch] @ V.T  # Shape: (batch_size, num_items)
-    # Generate recs for batch
-```
+- **Automatic**: `ModelEvaluator` handles batching internally
+- **Batch processing**: `U[batch] @ V.T` for memory efficiency
+- **Configurable**: Adjust `batch_size` based on available memory
 
 ### 2. Top-K Optimization
+
+#### Implementation
+- **Class**: `ModelEvaluator` với `use_argpartition` parameter
+- **Default**: `use_argpartition=True`
+- **Method**: `_get_top_k()` uses argpartition when K < n/2
+
+**Usage**:
+```python
+evaluator = ModelEvaluator(
+    U=U,
+    V=V,
+    k_values=[10, 20],
+    use_argpartition=True  # Use O(n) argpartition instead of O(n log n) argsort
+)
+```
 
 #### Problem
 `np.argsort` sorts all items (expensive cho large catalogs)
 
 #### Solution
-```python
-# Use argpartition (O(n) vs O(n log n))
-top_k_unsorted = np.argpartition(scores, -k)[-k:]
-top_k_sorted = top_k_unsorted[np.argsort(scores[top_k_unsorted])][::-1]
-```
+- **Automatic**: `ModelEvaluator` uses `argpartition` when K < n/2
+- **Algorithm**: O(n) vs O(n log n) for large catalogs
+- **Fallback**: Uses full `argsort` when K is large
 
 ### 3. Sparse Filtering
 
+#### Implementation
+- **Method**: `_get_top_k()` with `exclude_indices` parameter
+- **Efficiency**: Masks excluded items with `-np.inf` before argpartition/argsort
+- **Optimization**: Only processes valid indices
+
 #### Problem
-Masking seen items với `-inf` inefficient
+Masking seen items với `-inf` inefficient for very sparse data
 
 #### Solution
-```python
-# Precompute candidate items per user
-candidates = {u: set(range(num_items)) - user_pos_train[u] for u in users}
-
-# Evaluate only candidates
-for u in users:
-    cand_indices = list(candidates[u])
-    cand_scores = scores[cand_indices]
-    top_k = cand_indices[np.argsort(cand_scores)[::-1][:k]]
-```
+- **Current**: Efficient masking in `ModelEvaluator._get_top_k()`
+- **Alternative**: Could precompute candidate sets (not currently implemented)
+- **Note**: Current implementation is efficient for typical sparsity levels
 
 ## Hybrid Metrics: CF + BERT Evaluation
 
@@ -462,51 +937,45 @@ for u in users:
 Diversity = 1 - (1/K(K-1)) * ΣΣ similarity(i, j)  for i ≠ j
 ```
 
-#### Implementation với BERT Embeddings
+#### Implementation
+- **Module**: `recsys/cf/evaluation/hybrid_metrics.py`
+- **Class**: `DiversityMetric(HybridMetric)`
+- **Method**: `compute(recommendations, embeddings, item_to_idx)`
+- **Similarity**: Cosine similarity between BERT embeddings
+
+**Usage**:
 ```python
-def compute_diversity_bert(recommendations, bert_embeddings, item_to_idx):
-    """
-    Compute diversity using BERT embeddings.
-    
-    Args:
-        recommendations: List of product IDs
-        bert_embeddings: np.array (num_items, 768)
-        item_to_idx: Dict mapping product_id -> embedding idx
-    
-    Returns:
-        float: Diversity score [0, 1], higher = more diverse
-    """
-    if len(recommendations) < 2:
-        return 0.0
-    
-    # Get embeddings
-    embs = []
-    for product_id in recommendations:
-        if product_id in item_to_idx:
-            idx = item_to_idx[product_id]
-            embs.append(bert_embeddings[idx])
-    
-    if len(embs) < 2:
-        return 0.0
-    
-    embs = np.array(embs)
-    
-    # Normalize
-    embs_norm = embs / np.linalg.norm(embs, axis=1, keepdims=True)
-    
-    # Pairwise cosine similarities
-    similarities = []
-    for i in range(len(embs_norm)):
-        for j in range(i+1, len(embs_norm)):
-            sim = np.dot(embs_norm[i], embs_norm[j])
-            similarities.append(sim)
-    
-    # Diversity = 1 - avg similarity
-    avg_similarity = np.mean(similarities)
-    diversity = 1 - avg_similarity
-    
-    return diversity
+from recsys.cf.evaluation import DiversityMetric, compute_diversity_bert
+
+# Method 1: Using class
+diversity_metric = DiversityMetric(similarity_type='cosine')
+score = diversity_metric.compute(
+    recommendations=[1, 5, 3, 8, 2],
+    embeddings=bert_embeddings,  # (num_items, 768)
+    item_to_idx=item_to_idx  # Optional mapping
+)
+
+# Batch computation
+batch_results = diversity_metric.compute_batch(
+    all_recommendations={0: [1, 5, 3], 1: [2, 5, 8]},
+    embeddings=bert_embeddings,
+    item_to_idx=item_to_idx
+)
+# Returns: {'mean': 0.45, 'std': 0.12, 'min': 0.32, 'max': 0.58}
+
+# Method 2: Convenience function
+score = compute_diversity_bert(
+    recommendations=[1, 5, 3, 8, 2],
+    bert_embeddings=bert_embeddings,
+    item_to_idx=item_to_idx
+)
 ```
+
+#### Implementation Details
+- **Embeddings**: Uses BERT/PhoBERT embeddings for semantic similarity
+- **Normalization**: L2 normalization for cosine similarity
+- **Pairwise computation**: Computes all pairwise similarities
+- **Edge cases**: Returns 0.0 if <2 items, handles missing embeddings gracefully
 
 #### Interpretation
 - **Diversity = 0.3**: Items trong list tương đối similar (avg similarity = 0.7)
@@ -524,25 +993,45 @@ Alignment = (1/K) * Σ cosine_similarity(user_profile_bert, item_bert_i)
 ```
 
 #### Implementation
+- **Module**: `recsys/cf/evaluation/hybrid_metrics.py`
+- **Class**: `SemanticAlignmentMetric(HybridMetric)`
+- **Method**: `compute(user_profile_emb, recommendations, embeddings, item_to_idx)`
+
+**Usage**:
 ```python
-def compute_semantic_alignment(user_profile_emb, recommendations, item_embeddings, item_to_idx):
-    """
-    Đo semantic alignment của CF recommendations với user BERT profile.
-    """
-    # Normalize user profile
-    user_norm = user_profile_emb / np.linalg.norm(user_profile_emb)
-    
-    similarities = []
-    for product_id in recommendations:
-        if product_id in item_to_idx:
-            idx = item_to_idx[product_id]
-            item_emb = item_embeddings[idx]
-            item_norm = item_emb / np.linalg.norm(item_emb)
-            sim = np.dot(user_norm, item_norm)
-            similarities.append(sim)
-    
-    return np.mean(similarities) if similarities else 0.0
+from recsys.cf.evaluation import SemanticAlignmentMetric, compute_semantic_alignment
+
+# Method 1: Using class
+alignment_metric = SemanticAlignmentMetric()
+score = alignment_metric.compute(
+    user_profile_emb=user_profile_bert,  # (768,) user profile embedding
+    recommendations=[1, 5, 3, 8, 2],
+    embeddings=bert_embeddings,
+    item_to_idx=item_to_idx
+)
+
+# Batch computation
+batch_results = alignment_metric.compute_batch(
+    user_profiles={0: profile_0, 1: profile_1},
+    all_recommendations={0: [1, 5, 3], 1: [2, 5, 8]},
+    embeddings=bert_embeddings,
+    item_to_idx=item_to_idx
+)
+
+# Method 2: Convenience function
+score = compute_semantic_alignment(
+    user_profile_emb=user_profile_bert,
+    recommendations=[1, 5, 3, 8, 2],
+    item_embeddings=bert_embeddings,
+    item_to_idx=item_to_idx
+)
 ```
+
+#### Implementation Details
+- **User Profile**: Weighted average of user's historical item embeddings
+- **Similarity**: Cosine similarity between user profile and each recommended item
+- **Normalization**: L2 normalization for both user profile and item embeddings
+- **Output**: Mean similarity across all recommendations
 
 #### Use Case
 - **Evaluate CF quality**: CF recommendations có semantically relevant không?
@@ -559,100 +1048,207 @@ ColdStartCoverage = |Unique Cold Items in All Recs| / |Total Cold Items|
 ```
 
 #### Implementation
+- **Module**: `recsys/cf/evaluation/hybrid_metrics.py`
+- **Class**: `ColdStartCoverageMetric(HybridMetric)`
+- **Method**: `compute(all_recommendations, item_counts, cold_threshold)`
+
+**Usage**:
 ```python
-def compute_cold_start_coverage(all_recommendations, item_counts, cold_threshold=5):
-    """
-    Coverage của cold-start items.
-    
-    Args:
-        all_recommendations: Dict {user_id: [product_ids]}
-        item_counts: Series với item interaction counts
-        cold_threshold: Items với <N interactions = cold
-    
-    Returns:
-        float: Coverage [0, 1]
-    """
-    # Identify cold items
-    cold_items = set(item_counts[item_counts < cold_threshold].index)
-    
-    # Collect recommended cold items
-    recommended_cold = set()
-    for recs in all_recommendations.values():
-        recommended_cold.update([pid for pid in recs if pid in cold_items])
-    
-    coverage = len(recommended_cold) / len(cold_items) if cold_items else 0.0
-    return coverage
+from recsys.cf.evaluation import ColdStartCoverageMetric, compute_cold_start_coverage
+
+# Method 1: Using class
+cold_metric = ColdStartCoverageMetric(cold_threshold=5)
+score = cold_metric.compute(
+    all_recommendations={0: [1, 5, 3], 1: [2, 5, 8]},
+    item_counts=item_interaction_counts  # Series or Dict
+)
+
+# Method 2: Convenience function
+score = compute_cold_start_coverage(
+    all_recommendations={0: [1, 5, 3], 1: [2, 5, 8]},
+    item_counts=item_interaction_counts,
+    cold_threshold=5
+)
 ```
+
+#### Implementation Details
+- **Cold Threshold**: Items với <N interactions considered cold-start (default: 5)
+- **Identification**: Filters items by interaction count
+- **Coverage**: Percentage of cold items that appear in at least one recommendation list
+- **Edge cases**: Returns 0.0 if no cold items exist
+
+### 10. Novelty
+
+#### Definition
+**Novelty** đo lường mức độ unpopular/surprising của recommendations (long-tail items).
+
+#### Formula
+```
+Novelty@K = (1/K) * Σ log2(num_users / item_popularity_i)
+```
+
+#### Implementation
+- **Module**: `recsys/cf/evaluation/hybrid_metrics.py`
+- **Class**: `NoveltyMetric(HybridMetric)`
+- **Method**: `compute(recommendations, item_popularity, num_users, k=None)`
+
+**Usage**:
+```python
+from recsys.cf.evaluation import NoveltyMetric
+
+novelty_metric = NoveltyMetric(k=10)
+score = novelty_metric.compute(
+    recommendations=[1, 5, 3, 8, 2],
+    item_popularity=item_popularity,  # Array of popularity scores
+    num_users=26000
+)
+
+# Batch computation
+batch_results = novelty_metric.compute_batch(
+    all_recommendations={0: [1, 5, 3], 1: [2, 5, 8]},
+    item_popularity=item_popularity,
+    num_users=26000
+)
+```
+
+#### Interpretation
+- **High novelty**: Recommending unpopular (long-tail) items
+- **Low novelty**: Recommending popular items
+- **Trade-off**: High novelty có thể giảm accuracy (less popular items may be less relevant)
+
+### 11. Serendipity
+
+#### Definition
+**Serendipity** đo lường mức độ surprising yet relevant của recommendations.
+
+#### Formula
+```
+Serendipity = (1/K) * Σ [relevant_i * (1 - expected_i)]
+```
+Trong đó:
+- `relevant_i`: 1 nếu item_i in ground truth, else 0
+- `expected_i`: Probability item_i appears in baseline recommendations
+
+#### Implementation
+- **Module**: `recsys/cf/evaluation/hybrid_metrics.py`
+- **Class**: `SerendipityMetric(HybridMetric)`
+- **Method**: `compute(recommendations, ground_truth, baseline_recommendations, k=None)`
+
+**Usage**:
+```python
+from recsys.cf.evaluation import SerendipityMetric
+
+serendipity_metric = SerendipityMetric(k=10)
+score = serendipity_metric.compute(
+    recommendations=[1, 5, 3, 8, 2],
+    ground_truth={3, 8, 10},
+    baseline_recommendations=[100, 101, 102, 103, 104]  # Popular items
+)
+```
+
+#### Interpretation
+- **High serendipity**: Novel and relevant recommendations ("pleasant surprises")
+- **Measures**: Unexpectedness combined with relevance
+- **Use case**: Evaluate if model recommends items user wouldn't find themselves but would like
 
 ### Hybrid Evaluation Workflow
 
-#### Function: `evaluate_hybrid_model(U, V, bert_embeddings, test_data, user_profiles, k_values)`
+#### Hybrid Metric Collection
 
+- **Module**: `recsys/cf/evaluation/hybrid_metrics.py`
+- **Class**: `HybridMetricCollection`
+- **Purpose**: Evaluate multiple hybrid metrics together
+
+**Usage**:
 ```python
-def evaluate_hybrid_model(U, V, bert_embeddings, item_to_idx, 
-                          test_data, user_profiles, k_values=[10, 20]):
-    """
-    Comprehensive evaluation: CF metrics + hybrid metrics.
-    
-    Returns:
-        dict: {
-            # Standard CF metrics
-            'recall@10': float,
-            'ndcg@10': float,
-            'coverage': float,
-            
-            # Hybrid metrics
-            'diversity@10': float,
-            'semantic_alignment@10': float,
-            'cold_start_coverage': float,
-            
-            # Per-user stats
-            'diversity_std': float,
-            'alignment_std': float
-        }
-    """
-    results = {}
-    
-    # Standard CF evaluation
-    cf_metrics = evaluate_model(U, V, test_data, k_values)
-    results.update(cf_metrics)
-    
-    # Generate recommendations for diversity/alignment
-    test_users = test_data['u_idx'].unique()
-    all_recommendations = {}
-    user_diversity = []
-    user_alignment = []
-    
-    for u in test_users:
-        scores = U[u] @ V.T
-        top_k = np.argsort(scores)[::-1][:max(k_values)]
-        product_ids = [idx_to_product[i] for i in top_k]
-        all_recommendations[u] = product_ids
-        
-        # Diversity
-        div = compute_diversity_bert(product_ids[:10], bert_embeddings, item_to_idx)
-        user_diversity.append(div)
-        
-        # Semantic alignment
-        if u in user_profiles:
-            align = compute_semantic_alignment(
-                user_profiles[u], product_ids[:10], bert_embeddings, item_to_idx
-            )
-            user_alignment.append(align)
-    
-    # Aggregate
-    results['diversity@10'] = np.mean(user_diversity)
-    results['diversity_std'] = np.std(user_diversity)
-    results['semantic_alignment@10'] = np.mean(user_alignment) if user_alignment else 0.0
-    results['alignment_std'] = np.std(user_alignment) if user_alignment else 0.0
-    
-    # Cold-start coverage
-    item_counts = compute_item_counts(test_data)
-    results['cold_start_coverage'] = compute_cold_start_coverage(
-        all_recommendations, item_counts, cold_threshold=5
-    )
-    
-    return results
+from recsys.cf.evaluation import (
+    HybridMetricCollection,
+    DiversityMetric,
+    SemanticAlignmentMetric,
+    ColdStartCoverageMetric
+)
+
+# Create collection
+collection = HybridMetricCollection(
+    metrics=[
+        DiversityMetric(),
+        SemanticAlignmentMetric(),
+        ColdStartCoverageMetric(cold_threshold=5)
+    ]
+)
+
+# Evaluate
+results = collection.evaluate_all(
+    all_recommendations=recommendations,
+    embeddings=bert_embeddings,
+    user_profiles=user_profiles,
+    item_counts=item_counts,
+    item_to_idx=item_to_idx
+)
+```
+
+#### Complete Hybrid Evaluation
+
+**Workflow**:
+1. **Standard CF Evaluation**: Use `ModelEvaluator` for Recall, NDCG, etc.
+2. **Generate Recommendations**: Get top-K for all test users
+3. **Compute Hybrid Metrics**: 
+   - Diversity per user → aggregate
+   - Semantic alignment per user → aggregate
+   - Cold-start coverage (global)
+4. **Combine Results**: Merge CF metrics + hybrid metrics
+
+**Example**:
+```python
+from recsys.cf.evaluation import (
+    ModelEvaluator,
+    DiversityMetric,
+    SemanticAlignmentMetric,
+    ColdStartCoverageMetric
+)
+
+# Step 1: Standard CF evaluation
+cf_evaluator = ModelEvaluator(U, V, k_values=[10, 20])
+cf_results = cf_evaluator.evaluate(test_data, user_pos_train)
+
+# Step 2: Get recommendations
+recommendations = cf_evaluator.generate_recommendations(
+    test_users=test_users,
+    user_pos_train=user_pos_train,
+    k=10
+)
+
+# Step 3: Hybrid metrics
+diversity_metric = DiversityMetric()
+diversity_results = diversity_metric.compute_batch(
+    all_recommendations=recommendations,
+    embeddings=bert_embeddings,
+    item_to_idx=item_to_idx
+)
+
+alignment_metric = SemanticAlignmentMetric()
+alignment_results = alignment_metric.compute_batch(
+    user_profiles=user_profiles,
+    all_recommendations=recommendations,
+    embeddings=bert_embeddings,
+    item_to_idx=item_to_idx
+)
+
+cold_metric = ColdStartCoverageMetric(cold_threshold=5)
+cold_coverage = cold_metric.compute(
+    all_recommendations=recommendations,
+    item_counts=item_counts
+)
+
+# Step 4: Combine
+hybrid_results = {
+    **cf_results,
+    'diversity@10': diversity_results['mean'],
+    'diversity_std': diversity_results['std'],
+    'semantic_alignment@10': alignment_results['mean'],
+    'alignment_std': alignment_results['std'],
+    'cold_start_coverage': cold_coverage
+}
 ```
 
 ### Comparison: CF vs CF+BERT Reranking
@@ -750,28 +1346,85 @@ torch>=1.13.0
 ## Module Documentation
 
 ### Example Usage
+
+**Complete Evaluation Workflow**:
 ```python
-from recsys.cf.metrics import evaluate_model, evaluate_baseline_popularity
+from recsys.cf.evaluation import (
+    ModelEvaluator,
+    PopularityBaseline,
+    ModelComparator,
+    StatisticalTester,
+    ReportGenerator
+)
 
 # Load model and data
 U, V = load_model('artifacts/cf/als/')
 test_data, user_pos_train, item_popularity = load_test_data()
 
-# Evaluate CF model
+# Step 1: Evaluate CF model
+cf_evaluator = ModelEvaluator(U, V, k_values=[10, 20])
+cf_results = cf_evaluator.evaluate(test_data, user_pos_train)
+cf_per_user = cf_evaluator.get_per_user_metrics()
+
+print(f"ALS Recall@10: {cf_results['recall@10']:.3f}")
+print(f"ALS NDCG@10: {cf_results['ndcg@10']:.3f}")
+
+# Step 2: Evaluate baseline
+baseline = PopularityBaseline(item_popularity, num_items=2231)
+baseline_results = baseline.evaluate(test_data, user_pos_train, k_values=[10, 20])
+baseline_per_user = baseline.get_per_user_metrics()
+
+print(f"Baseline Recall@10: {baseline_results['recall@10']:.3f}")
+
+# Step 3: Compare with statistical testing
+comparator = ModelComparator()
+comparator.add_model_results('als', cf_results, cf_per_user)
+comparator.add_baseline_results('popularity', baseline_results, baseline_per_user)
+
+comparison_table = comparator.get_comparison_table()
+print(comparison_table)
+
+# Statistical significance
+tester = StatisticalTester()
+stat_result = tester.paired_t_test(
+    cf_per_user['recall@10'],
+    baseline_per_user['recall@10'],
+    alternative='greater'
+)
+
+if stat_result['significant']:
+    print(f"Significant improvement (p={stat_result['p_value']:.4f})")
+
+# Step 4: Generate report
+generator = ReportGenerator(output_dir='reports/')
+generator.add_results('als', cf_results)
+generator.add_results('popularity', baseline_results)
+generator.generate_csv_report('cf_eval_summary.csv')
+```
+
+**Quick Evaluation** (Convenience Functions):
+```python
+from recsys.cf.evaluation import (
+    evaluate_model,
+    evaluate_baseline_popularity,
+    compare_models
+)
+
+# Quick evaluation
 cf_metrics = evaluate_model(
     U, V, test_data, user_pos_train, k_values=[10, 20]
 )
-print(f"ALS Recall@10: {cf_metrics['recall@10']:.3f}")
 
-# Evaluate baseline
 baseline_metrics = evaluate_baseline_popularity(
-    test_data, item_popularity, k_values=[10, 20]
+    test_data, item_popularity, user_pos_train, k_values=[10, 20]
 )
-print(f"Baseline Recall@10: {baseline_metrics['recall@10']:.3f}")
 
-# Compare
-improvement = (cf_metrics['recall@10'] - baseline_metrics['recall@10']) / baseline_metrics['recall@10']
-print(f"Improvement: {improvement:.1%}")
+# Quick comparison
+comparison = compare_models(
+    {'als': cf_metrics},
+    {'popularity': baseline_metrics}
+)
+print(comparison)
 ```
 
 ## Timeline Estimate

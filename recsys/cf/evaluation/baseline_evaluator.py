@@ -490,7 +490,10 @@ class ItemSimilarityBaseline(BaselineRecommender):
         
         # Mask excluded items
         if exclude_items:
-            similarities[list(exclude_items)] = -np.inf
+            # Ensure indices are valid
+            exclude_list = [idx for idx in exclude_items if 0 <= idx < len(similarities)]
+            if exclude_list:
+                similarities[exclude_list] = -np.inf
         
         # Get top-K
         top_k = np.argsort(similarities)[::-1][:k]

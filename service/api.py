@@ -9,6 +9,9 @@ Endpoints:
 - POST /batch_recommend: Batch recommendation
 - POST /similar_items: Similar items
 - POST /reload_model: Hot-reload model
+- POST /search: Semantic search for products
+- POST /search/similar: Find similar products by product ID
+- POST /search/profile: Search based on user profile
 
 Usage:
     uvicorn service.api:app --host 0.0.0.0 --port 8000 --workers 4
@@ -34,6 +37,23 @@ if project_root not in sys.path:
 
 from service.recommender import CFRecommender, get_loader
 from service.recommender.cache import get_cache_manager, async_warmup
+
+# Import Smart Search service (lazy initialization)
+search_service = None
+
+
+def get_search_service():
+    """Lazy initialization of search service."""
+    global search_service
+    if search_service is None:
+        try:
+            from service.search import SmartSearchService
+            search_service = SmartSearchService()
+            search_service.initialize()
+            logger.info("Smart Search service initialized")
+        except Exception as e:
+            logger.warning(f"Could not initialize search service: {e}")
+    return search_service
 
 # ============================================================================
 # Logging Setup
@@ -266,6 +286,60 @@ class ReloadResponse(BaseModel):
     previous_model_id: Optional[str]
     new_model_id: Optional[str]
     reloaded: bool
+
+
+# ============================================================================
+# Smart Search Request/Response Models
+# ============================================================================
+
+class SearchRequest(BaseModel):
+    """Semantic search request."""
+    query: str = Field(..., min_length=1, max_length=500, description="Search query in Vietnamese")
+    topk: int = Field(default=10, ge=1, le=100, description="Number of results")
+    filters: Optional[Dict[str, Any]] = Field(
+        default=None,
+        description="Attribute filters: {brand, category, min_price, max_price}"
+    )
+    rerank: bool = Field(default=True, description="Apply hybrid reranking")
+
+
+class SearchSimilarRequest(BaseModel):
+    """Similar products search request."""
+    product_id: int = Field(..., description="Product ID to find similar products")
+    topk: int = Field(default=10, ge=1, le=50, description="Number of similar products")
+    exclude_self: bool = Field(default=True, description="Exclude the query product from results")
+
+
+class SearchByProfileRequest(BaseModel):
+    """Search based on user profile/history."""
+    product_history: List[int] = Field(..., min_length=1, description="List of product IDs user has interacted with")
+    topk: int = Field(default=10, ge=1, le=100, description="Number of results")
+    exclude_history: bool = Field(default=True, description="Exclude products in history from results")
+    filters: Optional[Dict[str, Any]] = Field(default=None, description="Attribute filters")
+
+
+class SearchResultItem(BaseModel):
+    """Single search result item."""
+    rank: int
+    product_id: int
+    product_name: str
+    brand: Optional[str]
+    category: Optional[str]
+    price: Optional[float]
+    avg_rating: Optional[float]
+    num_sold: Optional[int]
+    semantic_score: float
+    final_score: float
+
+
+class SearchResponse(BaseModel):
+    """Search response."""
+    query: str
+    results: List[SearchResultItem]
+    count: int
+    method: str
+    latency_ms: float
+    available_filters: Optional[Dict[str, Any]] = None
 
 
 # ============================================================================
@@ -587,6 +661,264 @@ async def clear_cache():
     
     cache_manager.clear_all()
     return {"status": "cleared"}
+
+
+# ============================================================================
+# Smart Search Endpoints
+# ============================================================================
+
+@app.post("/search", response_model=SearchResponse)
+async def search_products(request: SearchRequest):
+    """
+    Semantic search for products using Vietnamese query.
+    
+    This endpoint uses PhoBERT embeddings to find products semantically
+    similar to the search query. Supports Vietnamese text with automatic
+    abbreviation expansion (e.g., "srm" → "sữa rửa mặt").
+    
+    Args:
+        request: SearchRequest with query, topk, filters, rerank
+    
+    Returns:
+        SearchResponse with ranked results
+    
+    Example:
+        POST /search
+        {
+            "query": "kem dưỡng ẩm cho da khô",
+            "topk": 10,
+            "filters": {"brand": "Innisfree"},
+            "rerank": true
+        }
+    """
+    service = get_search_service()
+    if service is None:
+        raise HTTPException(status_code=503, detail="Search service not initialized")
+    
+    try:
+        start_time = time.perf_counter()
+        
+        response = service.search(
+            query=request.query,
+            topk=request.topk,
+            filters=request.filters,
+            rerank=request.rerank
+        )
+        
+        latency = (time.perf_counter() - start_time) * 1000
+        
+        # Convert to response format
+        results = [
+            SearchResultItem(
+                rank=r.rank,
+                product_id=r.product_id,
+                product_name=r.product_name,
+                brand=r.brand,
+                category=r.category,
+                price=r.price,
+                avg_rating=r.avg_rating,
+                num_sold=r.num_sold,
+                semantic_score=r.semantic_score,
+                final_score=r.final_score
+            )
+            for r in response.results
+        ]
+        
+        logger.info(
+            f"Search: query='{request.query[:50]}...', "
+            f"results={len(results)}, latency={latency:.1f}ms"
+        )
+        
+        return SearchResponse(
+            query=request.query,
+            results=results,
+            count=len(results),
+            method=response.method,
+            latency_ms=latency
+        )
+    
+    except Exception as e:
+        logger.error(f"Search error for query '{request.query}': {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/search/similar", response_model=SearchResponse)
+async def search_similar_products(request: SearchSimilarRequest):
+    """
+    Find products similar to a given product.
+    
+    Uses PhoBERT semantic embeddings to find products with similar
+    descriptions, ingredients, and features.
+    
+    Args:
+        request: SearchSimilarRequest with product_id, topk
+    
+    Returns:
+        SearchResponse with similar products
+    
+    Example:
+        POST /search/similar
+        {
+            "product_id": 12345,
+            "topk": 10,
+            "exclude_self": true
+        }
+    """
+    service = get_search_service()
+    if service is None:
+        raise HTTPException(status_code=503, detail="Search service not initialized")
+    
+    try:
+        start_time = time.perf_counter()
+        
+        response = service.search_similar(
+            product_id=request.product_id,
+            topk=request.topk,
+            exclude_self=request.exclude_self
+        )
+        
+        latency = (time.perf_counter() - start_time) * 1000
+        
+        # Convert to response format
+        results = [
+            SearchResultItem(
+                rank=r.rank,
+                product_id=r.product_id,
+                product_name=r.product_name,
+                brand=r.brand,
+                category=r.category,
+                price=r.price,
+                avg_rating=r.avg_rating,
+                num_sold=r.num_sold,
+                semantic_score=r.semantic_score,
+                final_score=r.final_score
+            )
+            for r in response.results
+        ]
+        
+        logger.info(
+            f"Similar search: product_id={request.product_id}, "
+            f"results={len(results)}, latency={latency:.1f}ms"
+        )
+        
+        return SearchResponse(
+            query=f"similar_to:{request.product_id}",
+            results=results,
+            count=len(results),
+            method=response.method,
+            latency_ms=latency
+        )
+    
+    except Exception as e:
+        logger.error(f"Similar search error for product {request.product_id}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/search/profile", response_model=SearchResponse)
+async def search_by_profile(request: SearchByProfileRequest):
+    """
+    Search based on user profile/history.
+    
+    Computes an average embedding from the user's product history
+    and finds products semantically similar to their interests.
+    
+    Args:
+        request: SearchByProfileRequest with product_history, topk
+    
+    Returns:
+        SearchResponse with personalized recommendations
+    
+    Example:
+        POST /search/profile
+        {
+            "product_history": [123, 456, 789],
+            "topk": 10,
+            "exclude_history": true
+        }
+    """
+    service = get_search_service()
+    if service is None:
+        raise HTTPException(status_code=503, detail="Search service not initialized")
+    
+    try:
+        start_time = time.perf_counter()
+        
+        response = service.search_by_user_profile(
+            product_history=request.product_history,
+            topk=request.topk,
+            exclude_history=request.exclude_history,
+            filters=request.filters
+        )
+        
+        latency = (time.perf_counter() - start_time) * 1000
+        
+        # Convert to response format
+        results = [
+            SearchResultItem(
+                rank=r.rank,
+                product_id=r.product_id,
+                product_name=r.product_name,
+                brand=r.brand,
+                category=r.category,
+                price=r.price,
+                avg_rating=r.avg_rating,
+                num_sold=r.num_sold,
+                semantic_score=r.semantic_score,
+                final_score=r.final_score
+            )
+            for r in response.results
+        ]
+        
+        logger.info(
+            f"Profile search: history_size={len(request.product_history)}, "
+            f"results={len(results)}, latency={latency:.1f}ms"
+        )
+        
+        return SearchResponse(
+            query=f"profile:{len(request.product_history)}_products",
+            results=results,
+            count=len(results),
+            method=response.method,
+            latency_ms=latency
+        )
+    
+    except Exception as e:
+        logger.error(f"Profile search error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/search/filters")
+async def get_search_filters():
+    """
+    Get available filter options for search.
+    
+    Returns:
+        Dict with available brands, categories, and price range
+    """
+    service = get_search_service()
+    if service is None:
+        raise HTTPException(status_code=503, detail="Search service not initialized")
+    
+    try:
+        return service.get_available_filters()
+    except Exception as e:
+        logger.error(f"Get filters error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/search/stats")
+async def get_search_stats():
+    """
+    Get search service statistics.
+    
+    Returns:
+        Search performance metrics and cache statistics
+    """
+    service = get_search_service()
+    if service is None:
+        return {"status": "not_initialized"}
+    
+    return service.get_stats()
 
 
 # ============================================================================

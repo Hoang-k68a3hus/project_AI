@@ -420,13 +420,13 @@ def load_bert_embeddings(
     
     # Try different file formats
     if (path / 'product_embeddings.pt').exists():
-        embeddings = torch.load(path / 'product_embeddings.pt')
+        embeddings = torch.load(path / 'product_embeddings.pt', map_location='cpu', weights_only=False)
         if isinstance(embeddings, torch.Tensor):
             embeddings = embeddings.numpy()
     elif (path / 'product_embeddings.npy').exists():
         embeddings = np.load(path / 'product_embeddings.npy')
     elif (path / 'item_embeddings.pt').exists():
-        embeddings = torch.load(path / 'item_embeddings.pt')
+        embeddings = torch.load(path / 'item_embeddings.pt', map_location='cpu', weights_only=False)
         if isinstance(embeddings, torch.Tensor):
             embeddings = embeddings.numpy()
     elif (path / 'item_embeddings.npy').exists():

@@ -117,7 +117,10 @@ class ModelEvaluator:
         if exclude_indices:
             # Mask excluded items
             scores = scores.copy()
-            scores[list(exclude_indices)] = -np.inf
+            # Convert to list if needed and ensure indices are valid
+            exclude_list = [idx for idx in exclude_indices if 0 <= idx < len(scores)]
+            if exclude_list:
+                scores[exclude_list] = -np.inf
         
         if self.use_argpartition and k < len(scores) // 2:
             # Use argpartition for efficiency (O(n) vs O(n log n))
@@ -425,7 +428,11 @@ class ModelEvaluator:
             'metrics': self._last_results
         }
         
-        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        # Create directory if needed
+        output_dir = os.path.dirname(output_path)
+        if output_dir:  # Only create if path has a directory component
+            os.makedirs(output_dir, exist_ok=True)
+        
         with open(output_path, 'w', encoding='utf-8') as f:
             json.dump(output, f, indent=2, ensure_ascii=False)
         

@@ -347,10 +347,11 @@ class ModelRegistry:
         # Get previous best for comparison
         prev_best = self._registry.get('current_best')
         prev_value = None
-        if prev_best:
-            prev_value = self._registry['models'].get(
-                prev_best['model_id'], {}
-            ).get('metrics', {}).get(metric)
+        if prev_best and isinstance(prev_best, dict):
+            prev_model_id = prev_best.get('model_id')
+            if prev_model_id:
+                prev_model = self._registry['models'].get(prev_model_id, {})
+                prev_value = prev_model.get('metrics', {}).get(metric)
         
         # Update current_best
         self._registry['current_best'] = {
@@ -372,9 +373,11 @@ class ModelRegistry:
         
         # Audit
         improvement = ""
-        if prev_value:
+        if prev_value is not None and prev_value > 0:
             pct = ((best_value - prev_value) / prev_value) * 100
             improvement = f"improvement=+{pct:.1f}%"
+        elif prev_value is not None and prev_value == 0 and best_value > 0:
+            improvement = "improvement=+inf%"
         self._audit_log('SELECT_BEST', best_id, f"{metric}={best_value:.4f} {improvement}")
         
         logger.info(f"Selected best model: {best_id} ({metric}={best_value:.4f})")
@@ -516,8 +519,8 @@ class ModelRegistry:
             raise KeyError(f"Model not found: {model_id}")
         
         # Check if it's current best
-        current_best = self._registry.get('current_best', {})
-        if current_best and current_best.get('model_id') == model_id:
+        current_best = self._registry.get('current_best')
+        if current_best and isinstance(current_best, dict) and current_best.get('model_id') == model_id:
             logger.warning(f"Cannot archive current best model: {model_id}")
             return False
         
@@ -549,8 +552,8 @@ class ModelRegistry:
             raise KeyError(f"Model not found: {model_id}")
         
         # Check if it's current best
-        current_best = self._registry.get('current_best', {})
-        if current_best and current_best.get('model_id') == model_id:
+        current_best = self._registry.get('current_best')
+        if current_best and isinstance(current_best, dict) and current_best.get('model_id') == model_id:
             raise ValueError(f"Cannot delete current best model: {model_id}")
         
         model = self._registry['models'][model_id]

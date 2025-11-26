@@ -1,0 +1,112 @@
+# Smart Search Configuration
+
+search:
+  enabled: true
+  default_topk: 10
+  max_topk: 100
+  
+  # Minimum semantic score to include in results (0-1)
+  # Lower = more results but potentially less relevant
+  min_semantic_score: 0.25
+  
+  # Enable multi-signal reranking
+  enable_rerank: true
+  
+  # Fetch more candidates for reranking (multiplier)
+  candidate_multiplier: 3
+
+# Reranking weights (should sum to 1.0)
+rerank:
+  weights:
+    semantic: 0.50      # PhoBERT embedding similarity
+    popularity: 0.25    # Sales/num_sold_time
+    quality: 0.15       # Average rating
+    recency: 0.10       # Product freshness (placeholder)
+
+# Query encoder configuration
+query_encoder:
+  model_name: "vinai/phobert-base"
+  max_length: 256
+  cache_size: 1000
+  device: "cpu"  # or "cuda" for GPU
+  
+  # Vietnamese abbreviation expansions
+  # Additional abbreviations can be added here
+  abbreviations:
+    # Product types
+    sp: "sản phẩm"
+    kem dc: "kem dưỡng da"
+    kem dd: "kem dưỡng da"
+    srm: "sữa rửa mặt"
+    tbc: "tẩy bong chết"
+    tdc: "tẩy da chết"
+    kcn: "kem chống nắng"
+    cn: "chống nắng"
+    nc: "nước"
+    nct: "nước cân bằng"
+    ncb: "nước cân bằng"
+    nht: "nước hoa hồng"
+    nhh: "nước hoa hồng"
+    
+    # Skin types
+    dn: "da nhờn"
+    dk: "da khô"
+    dh: "da hỗn hợp"
+    dhh: "da hỗn hợp"
+    dnc: "da nhạy cảm"
+    dm: "da mụn"
+    
+    # Common words
+    bt: "bình thường"
+    hq: "hiệu quả"
+    ko: "không"
+    dc: "được"
+    đc: "được"
+
+# Search index configuration
+index:
+  # Use FAISS for approximate nearest neighbor search
+  # Recommended for catalogs > 5000 products
+  use_faiss: false
+  
+  # FAISS index type:
+  # - 'flat': Exact search (brute force, best quality)
+  # - 'ivf': Inverted file index (faster, slight quality loss)
+  # - 'hnsw': Hierarchical navigable small world (very fast, good quality)
+  faiss_index_type: "flat"
+  
+  # Enable metadata filtering
+  enable_brand_filter: true
+  enable_category_filter: true
+  enable_price_filter: true
+
+# User profile configuration
+user_profile:
+  # Aggregation strategy for user history embeddings:
+  # - 'mean': Simple average
+  # - 'weighted_mean': Weighted by item importance (ratings, recency)
+  # - 'max': Max pooling
+  strategy: "weighted_mean"
+  
+  # Maximum number of history items to use
+  max_history_items: 50
+
+# Normalization configuration for signals
+normalization:
+  popularity:
+    method: "log"           # 'log', 'minmax', 'percentile'
+    max_value: 100000       # Cap for log normalization
+  
+  quality:
+    method: "linear"        # 'linear' for ratings
+    min_value: 1.0          # Minimum rating
+    max_value: 5.0          # Maximum rating
+
+# Logging configuration
+logging:
+  log_queries: true
+  log_latencies: true
+  slow_query_threshold_ms: 500
+  
+  # Log sample of queries for analysis
+  sample_rate: 0.1  # Log 10% of queries

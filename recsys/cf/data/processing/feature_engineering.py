@@ -3,7 +3,8 @@ Feature Engineering Module for Collaborative Filtering
 
 This module handles Step 2.0: Comment Quality Analysis and confidence score computation.
 Addresses the rating skew problem (95% 5-star ratings) by analyzing comment content
-to distinguish high-quality reviews from low-quality ones.
+to distinguish high-quality reviews from low-quality ones while down-weighting likely
+fake/spam reviews.
 
 Key Features:
 - AI-powered sentiment analysis using ViSoBERT for Vietnamese text
@@ -21,14 +22,16 @@ Model Architecture:
 - Output: Probability distribution via softmax
 """
 
+import json
 import logging
+from pathlib import Path
 from typing import Dict, Tuple, Optional
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import torch
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
 import warnings
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 # Suppress transformers warnings
 warnings.filterwarnings('ignore', category=FutureWarning)
@@ -64,7 +67,8 @@ class FeatureEngineer:
         device: Optional[str] = None,
         batch_size: int = 64,
         use_ai_sentiment: bool = True,
-        no_comment_quality: float = 0.5
+        no_comment_quality: float = 0.5,
+        enable_fake_review_checks: bool = True
     ):
         """
         Initialize FeatureEngineer with AI sentiment model.
@@ -90,6 +94,55 @@ class FeatureEngineer:
         self.batch_size = batch_size
         self.use_ai_sentiment = use_ai_sentiment
         self.no_comment_quality = float(np.clip(no_comment_quality, 0.0, 1.0))
+        self.enable_fake_review_checks = enable_fake_review_checks
+
+        # Keyword banks shared by both AI and fallback scoring
+        self.positive_keywords = [
+            'thấm nhanh', 'hiệu quả', 'thơm', 'mịn', 'sáng da',
+            'trắng da', 'giảm mụn', 'không kích ứng', 'tốt',
+            'rất thích', 'đáng mua', 'chất lượng', 'xuất sắc',
+            'hài lòng', 'ưng ý', 'tuyệt vời', 'hoàn hảo',
+            'mượt mà', 'tươi sáng', 'ẩm', 'mát', 'dễ chịu',
+            'auth', 'chuẩn auth', 'okela', 'okie', 'xịn sò',
+            'êm', 'êm ái', 'ngon lành', 'đáng tiền', 'đẹp mê',
+            'ưng bụng', 'phê', 'bao phê', 'yêu thích', 'sạch sâu',
+            'căng bóng', 'dễ dùng', 'dịu nhẹ', 'siêu thích', 'ổn áp',
+            'xanh mướt', 'mềm mại', 'thơm lâu', 'xinh xắn'
+        ]
+        self.negative_keywords = [
+            'hàng giả', 'fake', 'kém chất lượng', 'bị dị ứng',
+            'không giống mô tả', 'vỡ', 'hỏng', 'trễ giao',
+            'không nhận được', 'lừa đảo', 'mùi khó chịu', 'rất tệ',
+            'bể', 'móp méo', 'bẩn', 'dở tệ', 'đau rát',
+            'chậm giao', 'giao thiếu', 'hết hạn', 'mốc', 'nhớt',
+            'khó xài', 'nhức', 'rát da', 'khô căng', 'khó chịu',
+            'giả mạo', 'không uy tín', 'đòi hoàn', 'bom hàng'
+        ]
+
+        # Enrich domain keywords with slang/typo dictionaries if available
+        if self.enable_fake_review_checks:
+            self._augment_keywords_from_corrections()
+
+        # Load emoji/icon sentiment mappings
+        self._load_emoji_sentiment_mappings()
+
+        # Heuristic parameters for fake-review mitigation
+        self.long_review_min_words = 25
+        self.long_review_bonus_cap = 0.06
+        self.long_review_bonus_per_word = 0.002
+        self.short_review_max_words = 4
+        self.short_review_penalty = 0.08
+        self.keyword_bonus = 0.015
+        self.keyword_penalty = 0.02
+        self.keyword_bonus_cap = 0.05
+        self.keyword_penalty_cap = 0.08
+        self.recency_half_life_days = 365
+        self.recency_floor = 0.65
+        self.rating_mismatch_penalty = 0.12
+        self.low_sentiment_threshold = 0.3
+        self.high_sentiment_threshold = 0.7
+        self.repetition_penalty = 0.12
+        self.min_unique_char_ratio = 0.35
         
         # Setup device (GPU if available, otherwise CPU)
         if device is None:
@@ -130,15 +183,6 @@ class FeatureEngineer:
                 logger.warning("Falling back to keyword-based sentiment analysis")
                 self.model = None
                 self.tokenizer = None
-            
-            # Fallback: Vietnamese positive keywords for cosmetics domain
-            self.positive_keywords = [
-                'thấm nhanh', 'hiệu quả', 'thơm', 'mịn', 'sáng da',
-                'trắng da', 'giảm mụn', 'không kích ứng', 'tốt',
-                'rất thích', 'đáng mua', 'chất lượng', 'xuất sắc',
-                'hài lòng', 'ưng ý', 'tuyệt vời', 'hoàn hảo',
-                'mượt mà', 'tươi sáng', 'ẩm', 'mát', 'dễ chịu'
-            ]
     
     def compute_sentiment_scores_batch(self, texts: list) -> np.ndarray:
         """
@@ -468,6 +512,14 @@ class FeatureEngineer:
             df['comment_quality'] = df[comment_column].apply(self.compute_comment_quality_score)
         
         # Compute confidence scores
+        if self.enable_fake_review_checks:
+            logger.info("\nApplying fake-review heuristics (length, keywords, recency, mismatch)...")
+            suspicious_pct = self._apply_fake_review_adjustments(df, comment_column)
+            logger.info(
+                "  ↳ Flagged %.2f%% interactions as suspicious reviews",
+                suspicious_pct * 100.0
+            )
+
         logger.info("\nComputing confidence scores = rating + comment_quality...")
         df['confidence_score'] = df['rating'] + df['comment_quality']
         
@@ -505,6 +557,394 @@ class FeatureEngineer:
         logger.info("✓ All quality and confidence scores validated")
         
         return df, stats
+
+    def _augment_keywords_from_corrections(self) -> None:
+        """
+        Enrich keyword banks using typo/slang corrections collected from review data.
+        """
+        corrections_dir = Path("data/content_based_embeddings/processed/corrections_v2")
+        if not corrections_dir.exists():
+            logger.debug("Corrections directory %s not found; skipping keyword enrichment", corrections_dir)
+            self.positive_keywords = sorted(set(kw.lower() for kw in self.positive_keywords))
+            self.negative_keywords = sorted(set(kw.lower() for kw in self.negative_keywords))
+            return
+
+        positive_roots = {
+            'ưng', 'ưng ý', 'hài lòng', 'thích', 'tốt', 'đáng',
+            'xịn', 'chuẩn', 'auth', 'ổn', 'ok', 'okela', 'okie',
+            'thơm', 'dịu', 'êm', 'đẹp', 'mịn', 'mượt', 'phê',
+            'yêu', 'thần thánh', 'căng bóng', 'sáng', 'mát', 'dễ chịu'
+        }
+        negative_roots = {
+            'fake', 'giả', 'kém', 'tệ', 'dở', 'bẩn', 'móp', 'vỡ', 'hỏng',
+            'lừa', 'không giống', 'không nhận', 'chậm', 'trễ', 'khó chịu',
+            'mùi lạ', 'mùi khó chịu', 'dị ứng', 'rát', 'ngứa', 'hết hạn',
+            'mốc', 'bom', 'giao thiếu', 'nhớt', 'khô căng', 'đau', 'nứt'
+        }
+
+        pos_set = {kw.lower() for kw in self.positive_keywords}
+        neg_set = {kw.lower() for kw in self.negative_keywords}
+        pos_added = neg_added = 0
+
+        for file_path in sorted(corrections_dir.glob("corrected_chunk_*.json")):
+            try:
+                with open(file_path, "r", encoding="utf-8") as fp:
+                    data = json.load(fp)
+            except Exception as exc:
+                logger.warning("Failed to load %s: %s", file_path, exc)
+                continue
+
+            for typo, normalized in data.items():
+                typo_token = typo.strip().lower()
+                normalized_token = str(normalized).strip().lower()
+                if not typo_token or not normalized_token:
+                    continue
+
+                if any(root in normalized_token for root in positive_roots):
+                    if typo_token not in pos_set:
+                        pos_set.add(typo_token)
+                        pos_added += 1
+
+                if any(root in normalized_token for root in negative_roots):
+                    if typo_token not in neg_set:
+                        neg_set.add(typo_token)
+                        neg_added += 1
+
+        self.positive_keywords = sorted(pos_set)
+        self.negative_keywords = sorted(neg_set)
+
+        logger.info(
+            "✓ Enriched keyword banks from corrections_v2 ( +%d positive, +%d negative )",
+            pos_added,
+            neg_added
+        )
+
+    def _load_emoji_sentiment_mappings(self) -> None:
+        """
+        Load emoji/icon sentiment mappings from JSON file.
+        
+        Emoji are classified into positive, negative, and neutral categories
+        based on their meaning. This helps adjust sentiment scores when
+        emoji are present in reviews.
+        """
+        # Positive emoji patterns - indicate satisfaction/happiness
+        self.positive_emojis = {
+            # Hearts
+            'red_heart', 'orange_heart', 'yellow_heart', 'green_heart', 
+            'blue_heart', 'purple_heart', 'brown_heart', 'black_heart',
+            'white_heart', 'pink_heart', 'two_hearts', 'beating_heart',
+            'growing_heart', 'sparkling_heart', 'revolving_hearts',
+            'heart_with_arrow', 'heart_with_ribbon', 'heart_decoration',
+            'heart_exclamation', 'mending_heart', 'heart_on_fire',
+            'heart_hands', 'heart_hands_light_skin_tone', 'heart_hands_medium',
+            'anatomical_heart', 'heart_suit',
+            
+            # Happy faces
+            'smiling_face', 'smiling_face_with_hearts', 'smiling_face_with_heart',
+            'smiling_face_with_smiling_eyes', 'smiling_face_with_tear',
+            'smiling_face_with_open_hands', 'smiling_face_with_sunglasses',
+            'smiling_face_with_halo', 'beaming_face_with_smiling_eyes',
+            'grinning_face', 'grinning_face_with_smiling_eyes',
+            'grinning_face_with_big_eyes', 'grinning_face_with_sweat',
+            'grinning_squinting_face', 'face_with_tears_of_joy',
+            'slightly_smiling_face', 'winking_face', 'relieved_face',
+            'face_savoring_food', 'partying_face', 'zany_face',
+            'face_blowing_a_kiss', 'kissing_face', 'kissing_face_with_closed_eyes',
+            'kissing_face_with_smiling_eyes', 'smiling_cat_with_heart',
+            'grinning_cat', 'grinning_cat_with_smiling_eyes', 'cat_with_tears_of_joy',
+            
+            # Positive gestures
+            'thumbs_up', 'thumbs_up_light_skin_tone', 'thumbs_up_medium',
+            'thumbs_up_medium_skin_tone', 'thumbs_up_dark_skin_tone',
+            'ok_hand', 'ok_hand_light_skin_tone', 'ok_hand_medium',
+            'clapping_hands', 'clapping_hands_light_skin_tone', 'clapping_hands_medium',
+            'raising_hands', 'raising_hands_light_skin_tone',
+            'folded_hands', 'folded_hands_light_skin_tone',
+            'flexed_biceps', 'flexed_biceps_light_skin_tone', 'flexed_biceps_medium',
+            'victory_hand', 'love_you_gesture', 'call_me_hand',
+            'call_me_hand_light_skin_tone', 'call_me_hand_medium',
+            
+            # Positive symbols
+            'check_mark', 'check_mark_button', 'hundred_points',
+            'glowing_star', 'sparkles', 'star', 'shooting_star',
+            'fire', 'party_popper', 'confetti_ball', 'wrapped_gift',
+            'trophy', 'medal', 'crown', 'gem_stone',
+            'four_leaf_clover', 'cherry_blossom', 'rose', 'bouquet',
+            
+            # Others
+            'kiss_mark', 'love_letter', 'smiling_face_with_horns',
+        }
+        
+        # Negative emoji patterns - indicate dissatisfaction/sadness
+        self.negative_emojis = {
+            # Sad/angry faces
+            'crying_face', 'loudly_crying_face', 'face_holding_back_tears',
+            'sad_but_relieved_face', 'disappointed_face', 'pensive_face',
+            'worried_face', 'confused_face', 'slightly_frowning_face',
+            'frowning_face', 'frowning_face_with_open_mouth',
+            'anguished_face', 'fearful_face', 'anxious_face_with_sweat',
+            'downcast_face_with_sweat', 'weary_face', 'tired_face',
+            'persevering_face', 'confounded_face', 'pleading_face',
+            'grimacing_face', 'expressionless_face', 'neutral_face',
+            'face_without_mouth', 'face_in_clouds', 'dotted_line_face',
+            
+            # Angry faces
+            'angry_face', 'enraged_face', 'face_with_steam_from_nose',
+            'pouting_face', 'face_with_symbols_on_mouth',
+            'angry_face_with_horns', 'skull', 'skull_and_crossbones',
+            
+            # Sick/unwell faces
+            'nauseated_face', 'face_vomiting', 'sneezing_face',
+            'face_with_thermometer', 'face_with_head_bandage',
+            'dizzy_face', 'exploding_head', 'cold_face', 'hot_face',
+            'woozy_face', 'face_with_crossed_out_eyes',
+            
+            # Negative gestures
+            'thumbs_down', 'thumbs_down_light_skin_tone', 'thumbs_down_medium_skin_tone',
+            'middle_finger', 'middle_finger_light_skin_tone',
+            
+            # Negative symbols  
+            'cross_mark', 'broken_heart', 'anger_symbol',
+            'collision', 'bomb', 'warning', 'no_entry',
+            'prohibited', 'stop_sign',
+            
+            # Crying cats
+            'crying_cat', 'weary_cat', 'pouting_cat',
+        }
+        
+        # Neutral emoji - don't significantly affect sentiment
+        self.neutral_emojis = {
+            'thinking_face', 'face_with_raised_eyebrow', 'face_with_monocle',
+            'face_with_rolling_eyes', 'smirking_face', 'unamused_face',
+            'nerd_face', 'face_with_hand_over_mouth', 'shushing_face',
+            'lying_face', 'drooling_face', 'sleepy_face', 'sleeping_face',
+            'yawning_face', 'face_with_medical_mask', 'disguised_face',
+            'face_with_open_mouth', 'hushed_face', 'astonished_face',
+            'flushed_face', 'squinting_face_with_tongue', 'winking_face_with_tongue',
+            'face_with_tongue', 'money_mouth_face', 'sunglasses',
+            
+            # Pointing gestures
+            'backhand_index_pointing_right', 'backhand_index_pointing_left',
+            'backhand_index_pointing_up', 'backhand_index_pointing_down',
+            'index_pointing_up', 'backhand_index_pointing_right_light_skin_tone',
+            'backhand_index_pointing_left_light_skin_tone',
+            
+            # Other neutral
+            'waving_hand', 'waving_hand_light_skin_tone',
+            'raised_hand', 'raised_hand_light_skin_tone',
+            'hand_with_fingers_splayed', 'vulcan_salute',
+            'open_hands', 'open_hands_light_skin_tone',
+            'pinched_fingers', 'pinched_fingers_light_skin_tone',
+        }
+        
+        # Emoji bonus/penalty values
+        self.emoji_positive_bonus = 0.03  # Bonus per positive emoji
+        self.emoji_negative_penalty = 0.05  # Penalty per negative emoji
+        self.emoji_bonus_cap = 0.10  # Max bonus from emoji
+        self.emoji_penalty_cap = 0.15  # Max penalty from emoji
+        
+        logger.info(
+            "✓ Loaded emoji sentiment mappings: %d positive, %d negative, %d neutral",
+            len(self.positive_emojis), len(self.negative_emojis), len(self.neutral_emojis)
+        )
+
+    def _count_emojis_in_text(self, text: str) -> Tuple[int, int, int]:
+        """
+        Count positive, negative, and neutral emoji in text.
+        
+        Args:
+            text: Review text containing potential emoji patterns like "red_heart"
+            
+        Returns:
+            Tuple of (positive_count, negative_count, neutral_count)
+        """
+        import re
+        
+        text_lower = text.lower()
+        
+        # Find all underscore-connected words (potential emoji)
+        pattern = r'\b\w+(?:_\w+)+\b'
+        matches = re.findall(pattern, text_lower)
+        
+        pos_count = 0
+        neg_count = 0
+        neu_count = 0
+        
+        for match in matches:
+            # Check if it's a known emoji
+            if match in self.positive_emojis:
+                pos_count += 1
+            elif match in self.negative_emojis:
+                neg_count += 1
+            elif match in self.neutral_emojis:
+                neu_count += 1
+            else:
+                # Check partial matches for emoji patterns with skin tone suffixes
+                base_match = match.split('_light_skin_tone')[0].split('_medium')[0].split('_dark_skin_tone')[0]
+                if base_match in self.positive_emojis:
+                    pos_count += 1
+                elif base_match in self.negative_emojis:
+                    neg_count += 1
+        
+        return pos_count, neg_count, neu_count
+
+    def _apply_emoji_adjustment(self, base_score: float, text: str) -> float:
+        """
+        Adjust sentiment score based on emoji presence in text.
+        
+        Args:
+            base_score: Base sentiment score [0.0, 1.0]
+            text: Review text
+            
+        Returns:
+            Adjusted score [0.0, 1.0]
+        """
+        if not text or not isinstance(text, str):
+            return base_score
+        
+        pos_count, neg_count, neu_count = self._count_emojis_in_text(text)
+        
+        # Calculate adjustment
+        positive_bonus = min(pos_count * self.emoji_positive_bonus, self.emoji_bonus_cap)
+        negative_penalty = min(neg_count * self.emoji_negative_penalty, self.emoji_penalty_cap)
+        
+        adjusted = base_score + positive_bonus - negative_penalty
+        
+        return float(np.clip(adjusted, 0.0, 1.0))
+
+    def _apply_fake_review_adjustments(self, df: pd.DataFrame, comment_column: str) -> float:
+        """
+        Apply heuristic adjustments to comment_quality to down-weight suspected fake reviews.
+
+        Args:
+            df: DataFrame with comment_quality already computed.
+            comment_column: Column containing the original text.
+
+        Returns:
+            float: Ratio of rows flagged as suspicious (for logging/monitoring).
+        """
+        if comment_column not in df.columns or 'comment_quality' not in df.columns:
+            return 0.0
+
+        comments = df[comment_column].fillna('').astype(str).to_numpy()
+        scores = df['comment_quality'].to_numpy(dtype=np.float32, copy=True)
+        ratings = df['rating'].to_numpy(copy=False) if 'rating' in df.columns else None
+        timestamps = df['cmt_date'].to_numpy(copy=False) if 'cmt_date' in df.columns else None
+
+        suspicious_mask = np.zeros(len(scores), dtype=bool)
+        # Use timezone-naive timestamp to match cmt_date column (timezone-naive)
+        current_time = pd.Timestamp.now()
+
+        for idx in range(len(scores)):
+            rating_value = ratings[idx] if ratings is not None else None
+            ts_value = timestamps[idx] if timestamps is not None else None
+            adjusted_score, flagged = self._adjust_quality_score(
+                base_score=scores[idx],
+                comment_text=comments[idx],
+                rating=rating_value,
+                timestamp=ts_value,
+                current_time=current_time
+            )
+            scores[idx] = adjusted_score
+            suspicious_mask[idx] = flagged
+
+        df['comment_quality'] = scores
+        if 'is_suspicious_review' in df.columns:
+            df['is_suspicious_review'] = df['is_suspicious_review'] | suspicious_mask
+        else:
+            df['is_suspicious_review'] = suspicious_mask
+
+        return float(suspicious_mask.mean())
+
+    def _adjust_quality_score(
+        self,
+        base_score: float,
+        comment_text: str,
+        rating: Optional[float],
+        timestamp,
+        current_time: Optional[pd.Timestamp] = None
+    ) -> Tuple[float, bool]:
+        """
+        Apply additional heuristics to detect/penalize likely fake reviews.
+
+        Returns:
+            Tuple[float, bool]: (adjusted_score, is_suspicious)
+        """
+        score = float(np.clip(base_score, 0.0, 1.0))
+        text = (comment_text or "").strip()
+        if not text:
+            return score, False
+
+        suspicious = False
+        text_lower = text.lower()
+        words = text_lower.split()
+        word_count = len(words)
+
+        # Length-based adjustments
+        high_rating_context = True
+        if rating is not None and not pd.isna(rating):
+            high_rating_context = float(rating) >= self.positive_threshold
+
+        if word_count >= self.long_review_min_words:
+            extra_words = word_count - self.long_review_min_words
+            bonus = 0.02 + extra_words * self.long_review_bonus_per_word
+            bonus = min(bonus, self.long_review_bonus_cap)
+            score += bonus
+        elif word_count <= self.short_review_max_words and high_rating_context:
+            score -= self.short_review_penalty
+            suspicious = True  # extremely short comments with high ratings are often fake
+
+        # Keyword-based modifiers
+        pos_hits = sum(1 for kw in self.positive_keywords if kw in text_lower)
+        neg_hits = sum(1 for kw in self.negative_keywords if kw in text_lower)
+        if pos_hits:
+            score += min(self.keyword_bonus_cap, pos_hits * self.keyword_bonus)
+        if neg_hits:
+            score -= min(self.keyword_penalty_cap, neg_hits * self.keyword_penalty)
+
+        # Rating vs text mismatch
+        if rating is not None and not pd.isna(rating):
+            rating_val = float(rating)
+            if rating_val >= self.positive_threshold and score < self.low_sentiment_threshold:
+                score *= (1 - self.rating_mismatch_penalty)
+                suspicious = True
+            elif rating_val <= self.hard_negative_threshold and score > self.high_sentiment_threshold:
+                score *= (1 - self.rating_mismatch_penalty * 0.6)
+                suspicious = True
+
+        # Recency decay (older reviews carry less weight)
+        if timestamp is not None and not pd.isna(timestamp):
+            ts = pd.to_datetime(timestamp, errors='coerce')
+            if pd.notna(ts) and current_time is not None:
+                # Handle timezone mismatch: make both timezone-naive if one is naive
+                # This ensures compatibility when cmt_date is timezone-naive
+                if ts.tz is None and current_time.tz is not None:
+                    current_time_naive = current_time.tz_localize(None)
+                elif ts.tz is not None and current_time.tz is None:
+                    ts = ts.tz_localize(None)
+                    current_time_naive = current_time
+                else:
+                    # Both have same timezone awareness (both naive or both aware)
+                    current_time_naive = current_time
+                
+                age_days = max(0.0, (current_time_naive - ts).days)
+                if age_days > 0 and self.recency_half_life_days > 0:
+                    decay = np.exp(-age_days / self.recency_half_life_days)
+                    recency_factor = self.recency_floor + (1 - self.recency_floor) * decay
+                    score *= recency_factor
+
+        # Repetition / low uniqueness penalty (common in fake reviews)
+        unique_chars = len(set(text_lower.replace(' ', '')))
+        total_chars = max(1, len(text_lower.replace(' ', '')))
+        unique_ratio = unique_chars / total_chars
+        if unique_ratio < self.min_unique_char_ratio:
+            score *= (1 - self.repetition_penalty)
+            suspicious = True
+
+        # Emoji-based adjustments
+        score = self._apply_emoji_adjustment(score, text)
+
+        return float(np.clip(score, 0.0, 1.0)), suspicious
     
     def _compute_quality_stats(self, df: pd.DataFrame, comment_column: str) -> Dict[str, any]:
         """

@@ -138,7 +138,7 @@ def get_git_commit(repo_path: Optional[str] = None) -> Optional[str]:
 def get_git_commit_short(repo_path: Optional[str] = None) -> Optional[str]:
     """Get short (7 char) git commit hash."""
     commit = get_git_commit(repo_path)
-    return commit[:7] if commit else None
+    return commit[:7] if commit and len(commit) >= 7 else commit
 
 
 def get_git_branch(repo_path: Optional[str] = None) -> Optional[str]:
@@ -244,9 +244,14 @@ def compute_directory_hash(
         # Add filename
         hasher.update(file_path.name.encode())
         
-        # Add file hash
-        file_hash = compute_file_hash(str(file_path))
-        hasher.update(file_hash.encode())
+        # Add file hash (only if file exists and is readable)
+        try:
+            file_hash = compute_file_hash(str(file_path))
+            hasher.update(file_hash.encode())
+        except (OSError, IOError) as e:
+            logger.warning(f"Could not hash file {file_path}: {e}")
+            # Use filename only as fallback
+            hasher.update(file_path.name.encode())
     
     return hasher.hexdigest()
 

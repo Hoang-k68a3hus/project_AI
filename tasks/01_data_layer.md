@@ -110,6 +110,26 @@ Tất cả nằm trong `data/published_data/`:
 - **Rating distribution**: Check for rating bias (e.g., >90% ratings = 5)
 - **Action**: Log outliers, quyết định filter sau
 
+#### 1.4 Chuẩn hóa & Sửa lỗi chính tả (@data)
+- **Mục tiêu**: Làm sạch `processed_comment` trước khi chạy sentiment để giảm nhiễu từ teencode, viết tắt và lỗi gõ.
+- **Nguồn script**: Thư mục `data/` chứa đầy đủ công cụ:
+  - `apply_spelling_corrections.py`: Chuẩn hóa teencode, dấu câu, viết hoa đầu câu.
+  - `apply_abbreviation_corrections.py` + `apply_abbreviation_corrections_v2.py`: Mở rộng viết tắt phổ biến trong review mỹ phẩm.
+  - `apply_full_spelling_corrections.py`, `merge_corrections.py`: Hợp nhất bảng thay thế tùy chỉnh, bổ sung rules đặc thù thương hiệu.
+  - `split_word_frequency.py`, `analyze_underscore_words.py`: Hỗ trợ thống kê để cập nhật dictionary.
+- **Quy trình**:
+  1. Tạo/ cập nhật file mapping trong `data/processed/` (ví dụ `typo_mapping.json`).
+  2. Chạy pipeline sửa lỗi:
+     ```bash
+     python data/apply_spelling_corrections.py \
+       --input data/published_data/data_reviews_purchase.csv \
+       --output data/processed/data_reviews_spell_fixed.csv \
+       --mapping data/processed/typo_mapping.json
+     ```
+  3. Lặp lại với script viết tắt (`apply_abbreviation_corrections*.py`) để đảm bảo các cụm như "spf", "msm" được chuẩn hóa.
+  4. Dùng `verify_integrity.py` để so khớp số dòng trước/ sau khi sửa.
+- **Kết quả**: Cột `processed_comment` được thay thế bằng phiên bản đã chuẩn hóa, lưu trong `data/processed/` và nạp lại ở Step 2 cho sentiment.
+
 **✅ UPDATED**: `DataValidator` must enforce strict temporal validation and rating range checks
 
 ### Step 2: Explicit Feedback Feature Engineering

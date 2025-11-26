@@ -103,12 +103,18 @@ class ModelLoader:
         self._lock = threading.RLock()
         
         # Load registry
-        self._registry = ModelRegistry(registry_path, auto_create=False)
+        try:
+            self._registry = ModelRegistry(registry_path, auto_create=False)
+        except FileNotFoundError:
+            logger.warning(f"Registry not found at {registry_path}, creating empty registry")
+            self._registry = ModelRegistry(registry_path, auto_create=True)
         
         # Auto-load
         if auto_load:
             try:
                 self.load_current_best()
+            except (ValueError, KeyError) as e:
+                logger.warning(f"Auto-load failed (no models in registry): {e}")
             except Exception as e:
                 logger.warning(f"Auto-load failed: {e}")
     
@@ -126,20 +132,43 @@ class ModelLoader:
         
         Returns:
             Tuple of (U, V, params, metadata)
+        
+        Raises:
+            FileNotFoundError: If required files are missing
         """
         path = Path(model_path)
+        
+        if not path.exists():
+            raise FileNotFoundError(f"Model path does not exist: {model_path}")
+        
         prefix = model_type
         
         # Load embeddings
-        U = np.load(path / f"{prefix}_U.npy")
-        V = np.load(path / f"{prefix}_V.npy")
+        u_file = path / f"{prefix}_U.npy"
+        v_file = path / f"{prefix}_V.npy"
+        
+        if not u_file.exists():
+            raise FileNotFoundError(f"Missing file: {u_file}")
+        if not v_file.exists():
+            raise FileNotFoundError(f"Missing file: {v_file}")
+        
+        U = np.load(u_file)
+        V = np.load(v_file)
         
         # Load params
-        with open(path / f"{prefix}_params.json", 'r', encoding='utf-8') as f:
+        params_file = path / f"{prefix}_params.json"
+        if not params_file.exists():
+            raise FileNotFoundError(f"Missing file: {params_file}")
+        
+        with open(params_file, 'r', encoding='utf-8') as f:
             params = json.load(f)
         
         # Load metadata
-        with open(path / f"{prefix}_metadata.json", 'r', encoding='utf-8') as f:
+        metadata_file = path / f"{prefix}_metadata.json"
+        if not metadata_file.exists():
+            raise FileNotFoundError(f"Missing file: {metadata_file}")
+        
+        with open(metadata_file, 'r', encoding='utf-8') as f:
             metadata = json.load(f)
         
         return U, V, params, metadata

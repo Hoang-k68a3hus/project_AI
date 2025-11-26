@@ -204,6 +204,34 @@ Thư mục này chứa tài liệu chi tiết cho việc xây dựng hệ thốn
 
 ---
 
+### [09 - Smart Search](./09_smart_search.md)
+**Mục tiêu**: Tích hợp tính năng tìm kiếm thông minh sử dụng PhoBERT embeddings
+
+**Nội dung**:
+- **Query Encoder**: Encode text queries thành embeddings với PhoBERT
+- **Search Index**: FAISS/exact search cho semantic similarity
+- **Smart Search Service**: Text-to-product discovery
+- **Similar Items Search**: Item-item similarity
+- **User Profile Search**: Recommendations từ browsing history
+- **Reranking**: Multi-signal ranking (semantic, popularity, quality)
+- **API Endpoints**: /search, /search/similar, /search/profile
+
+**Modules**:
+- `service/search/query_encoder.py`
+- `service/search/search_index.py`
+- `service/search/smart_search.py`
+
+**API Endpoints**:
+- `POST /search`: Text query search
+- `POST /search/similar`: Item-item search
+- `POST /search/profile`: User profile-based search
+
+**Config**: `service/config/search_config.yaml`
+
+**Timeline**: ~7 days
+
+---
+
 ## Thứ Tự Triển Khai Khuyến Nghị
 
 ### Phase 1: Foundation (Tuần 1-2)
@@ -238,7 +266,14 @@ Thư mục này chứa tài liệu chi tiết cho việc xây dựng hệ thốn
    - Optional enhancement
    - Có thể implement từng phần (content first, diversity sau)
 
-**Tổng timeline**: ~6 tuần (với 1 người full-time)
+### Phase 5: Smart Features (Tuần 7)
+9. **Task 09 - Smart Search** (7 days)
+   - Semantic search với PhoBERT embeddings
+   - Text query → product discovery
+   - Similar items và user profile search
+   - Tích hợp với embeddings đã có sẵn
+
+**Tổng timeline**: ~7 tuần (với 1 người full-time)
 
 ## Integration với Hệ Thống Hiện Tại
 

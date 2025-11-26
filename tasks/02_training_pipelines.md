@@ -60,6 +60,35 @@ Preprocessed Data (từ Task 01)
               Update Registry (best model)
 ```
 
+## Module Architecture Overview
+
+Code đã được tổ chức thành **class-based architecture** với các modules riêng biệt:
+
+```
+recsys/cf/model/
+├── __init__.py
+├── bert_enhanced_als.py      # BERT-enhanced ALS wrapper
+├── als/
+│   ├── __init__.py           # Package exports
+│   ├── pre_data.py           # ALSMatrixPreparer - Step 1
+│   ├── model_init.py         # ALSModelInitializer - Step 2
+│   ├── trainer.py            # ALSTrainer - Step 3
+│   ├── embeddings.py         # EmbeddingExtractor - Step 4
+│   ├── recommender.py        # ALSRecommender - Step 5
+│   ├── evaluation.py         # ALSEvaluator - Step 6
+│   ├── artifact_saver.py     # Artifact saving - Step 7
+│   ├── run_als_complete.py  # Complete pipeline script
+│   └── train_als_complete.py
+└── bpr/
+    ├── __init__.py           # Package exports
+    ├── pre_data.py           # BPRDataPreparer - Step 1
+    ├── sampler.py            # TripletSampler, HardNegativeMixer - Step 2
+    ├── model_init.py         # BPRModelInitializer - Step 3
+    ├── trainer.py            # BPRTrainer - Step 4
+    ├── artifact_saver.py     # Artifact saving - Step 7
+    └── ...
+```
+
 ## Shared Components
 
 ### 1. Data Loading (Updated: DataProcessor Orchestration)
@@ -89,6 +118,27 @@ Preprocessed Data (từ Task 01)
   - `user_pos_sets`: Dict[u, Set[i]] (BPR sampling)
   - `hard_neg_sets`: Dict[u, Set[i]] (BPR sampling)
   - `mappings`: ID mappings from `processor.id_mapper`
+
+### 1.1 ALS Data Preparation (Module: `recsys/cf/model/als/pre_data.py`)
+- **Class**: `ALSMatrixPreparer`
+- **Method**: `prepare_complete_als_data()`
+- **Purpose**: Load processed data from Task 01 and prepare for ALS training
+- **Outputs**: 
+  - `X_train_implicit`: Transposed CSR matrix (items × users) for implicit library
+  - `X_train_confidence`: Original confidence matrix (users × items)
+  - `mappings`: ID mappings
+  - `user_pos_train`: User positive sets
+  - `metadata`: Data statistics
+
+### 1.2 BPR Data Preparation (Module: `recsys/cf/model/bpr/pre_data.py`)
+- **Class**: `BPRDataPreparer` / `BPRDataLoader`
+- **Method**: `load_bpr_data()` or `prepare_bpr_data()`
+- **Purpose**: Load positive sets, pairs, and hard negative sets for BPR training
+- **Outputs**:
+  - `positive_pairs`: Array of (u_idx, i_idx) pairs
+  - `user_pos_sets`: Dict[u_idx, Set[i_idx]]
+  - `hard_neg_sets`: Dict[u_idx, Set[i_idx]] (explicit + implicit)
+  - `num_users`, `num_items`: Dimensions
 
 ### 2. Configuration Management
 - **File**: `config/training_config.yaml`
@@ -131,20 +181,39 @@ Preprocessed Data (từ Task 01)
 ### Step 1: Matrix Preparation (UPDATED: Sentiment-Enhanced Confidence)
 
 #### 1.1 Load Confidence Matrix
-- **Method**: `DataProcessor.prepare_als_matrix`
-- **Underlying Class**: `ALSDataPreparer` (`recsys/cf/data/processing/als_data.py`)
-- **Input**: DataFrame with `confidence_score` (computed in Step 2.0)
+- **Module**: `recsys/cf/model/als/pre_data.py`
+- **Class**: `ALSMatrixPreparer`
+- **Method**: `prepare_complete_als_data()` or `quick_prepare_als_matrix()`
+- **Input**: Processed data from Task 01 (Parquet files, NPZ matrices)
 - **Logic**:
+  - Loads `X_train_confidence.npz` (CSR matrix with confidence scores)
   - `confidence_score = rating + comment_quality` (Range: 1.0 - 6.0)
-  - **Normalization** (Optional): `(conf - 1) / 5` → [0, 1]
-- **Output**: `csr_matrix` of shape (num_users, num_items)
+  - **Transpose**: Converts to item-user format for implicit library
+- **Output**: 
+  - `X_train_implicit`: Transposed CSR matrix (items × users) for `implicit` library
+  - `X_train_confidence`: Original confidence matrix (users × items)
+  - `mappings`: ID mappings
+  - `user_pos_train`: User positive sets for filtering
+
+**Usage**:
+```python
+from recsys.cf.model.als import ALSMatrixPreparer
+
+preparer = ALSMatrixPreparer(base_path='data/processed')
+data = preparer.prepare_complete_als_data()
+X_train = data['X_train_implicit']  # Ready for implicit library
+```
 
 #### 1.2 Confidence Scaling Strategy
-- **Implementation**: Handled within `ALSDataPreparer` or during training
+- **Implementation**: Handled in `ALSModelInitializer` with alpha recommendation
 - **Range**: 
-  - Raw: [1.0, 6.0] (Default)
-  - Normalized: [0.0, 1.0]
-- **Recommendation**: Use **Raw** scores with lower alpha (5-10) or **Normalized** with standard alpha (20-40).
+  - Raw: [1.0, 6.0] (Default) → alpha = 5-10 (lower due to higher range)
+  - Normalized: [0.0, 1.0] → alpha = 20-40 (standard scaling)
+- **Auto-recommendation**: `ALSModelInitializer.get_alpha_recommendation(confidence_range)`
+- **Presets**: 
+  - `'default'`: alpha=10 (for raw 1-6 range)
+  - `'normalized'`: alpha=40 (for 0-1 range)
+  - `'sparse_data'`: alpha=5, reg=0.1 (for very sparse data)
 
 #### 1.3 Preference Matrix (Optional)
 - **P**: Can derive binary preference from confidence
@@ -159,106 +228,331 @@ Preprocessed Data (từ Task 01)
 - **Preferred**: `implicit` library (C++ backend, fast, GPU support)
   - Install: `pip install implicit`
   - Model: `implicit.als.AlternatingLeastSquares`
-- **Alternative**: Custom NumPy implementation (slower, educational)
+- **Module**: `recsys/cf/model/als/model_init.py`
+- **Class**: `ALSModelInitializer`
 
-#### 2.2 Hyperparameters
-- **factors**: Embedding dimension (32/64/128)
-  - Start với 64, tune sau
-- **regularization**: L2 penalty (0.001 - 0.1)
-  - Prevent overfitting, start 0.01
-- **iterations**: ALS iterations (10-20)
-  - Monitor loss convergence
-- **alpha**: Confidence scaling (20-80)
-  - Higher → trust positives more
-- **random_seed**: For reproducibility
+#### 2.2 Hyperparameters & Presets
+- **Module**: `recsys/cf/model/als/model_init.py`
+- **Class**: `ALSModelInitializer` với configuration presets:
+  - `'default'`: factors=64, reg=0.01, alpha=10 (for sentiment-enhanced confidence 1-6)
+  - `'normalized'`: factors=64, reg=0.01, alpha=40 (for normalized 0-1)
+  - `'high_quality'`: factors=128, reg=0.05, iterations=20
+  - `'fast'`: factors=32, reg=0.01, iterations=10
+  - `'sparse_data'`: factors=64, reg=0.1, alpha=5 (for ≥2 threshold, high sparsity)
 
-#### 2.3 Initialization
+**Hyperparameters**:
+- **factors**: Embedding dimension (32/64/128) - Start với 64
+- **regularization**: L2 penalty (0.01-0.1) - Higher for sparse data (0.1 for ≥2 threshold)
+- **iterations**: ALS iterations (10-20) - Monitor convergence
+- **alpha**: Confidence scaling (5-10 for raw 1-6, 20-40 for normalized 0-1)
+- **random_seed**: For reproducibility (default: 42)
+- **use_gpu**: GPU acceleration (requires cupy)
+
+#### 2.3 Initialization Methods
+
+**Method 1: Using Preset** (Recommended):
 ```python
-from implicit.als import AlternatingLeastSquares
+from recsys.cf.model.als import ALSModelInitializer
 
-model = AlternatingLeastSquares(
+initializer = ALSModelInitializer(preset='default')
+model = initializer.initialize_model()
+```
+
+**Method 2: Custom Configuration**:
+```python
+from recsys.cf.model.als import ALSModelInitializer
+
+config = {
+    'factors': 64,
+    'regularization': 0.01,
+    'iterations': 15,
+    'alpha': 10,  # Lower for sentiment-enhanced confidence (1-6 range)
+    'random_state': 42,
+    'use_gpu': False
+}
+initializer = ALSModelInitializer(config=config)
+model = initializer.initialize_model()
+```
+
+**Method 3: Quick Initialization**:
+```python
+from recsys.cf.model.als import quick_initialize_als
+
+model = quick_initialize_als(
     factors=64,
     regularization=0.01,
     iterations=15,
-    alpha=40,
-    random_state=42,
-    use_gpu=False  # Set True nếu có CUDA
+    alpha=10,
+    use_gpu=False,
+    random_state=42
 )
+```
+
+**Method 4: Data-Driven Recommendations**:
+```python
+from recsys.cf.model.als import ALSModelInitializer
+
+initializer = ALSModelInitializer()
+recommended_config = initializer.recommend_config_for_data(
+    num_users=26000,
+    num_items=2231,
+    nnz=65000,
+    confidence_range=(1.0, 6.0)
+)
+# Returns: {'factors': 64, 'regularization': 0.1, 'alpha': 10, ...}
+initializer.update_config(**recommended_config)
+model = initializer.initialize_model()
 ```
 
 ### Step 3: Training
 
 #### 3.1 Fit Model
-- **Input**: Transposed CSR matrix `X_train.T` (items × users)
-  - `implicit` expects item-user matrix
+- **Module**: `recsys/cf/model/als/trainer.py`
+- **Class**: `ALSTrainer`
+- **Input**: Transposed CSR matrix `X_train_implicit` (items × users)
+  - `implicit` library expects item-user matrix format
 - **Process**: 
   - Alternates giữa fixing U update V, và fixing V update U
   - Mỗi iteration solve least squares với regularization
-- **Monitoring**: 
-  - Log loss mỗi iteration (nếu available)
-  - Estimate training time
+- **Features**:
+  - Progress tracking với iteration metrics
+  - Optional checkpointing every N iterations
+  - Memory usage monitoring
+  - Validation-based early stopping (optional)
+
+**Usage**:
+```python
+from recsys.cf.model.als import ALSTrainer
+
+trainer = ALSTrainer(
+    model=model,
+    checkpoint_dir=Path('artifacts/cf/als/checkpoints'),
+    checkpoint_interval=5,
+    track_memory=True,
+    enable_validation=False
+)
+
+# Fit model
+results = trainer.fit(X_train_implicit)
+# Returns: TrainingHistory with iteration metrics
+```
 
 #### 3.2 Progress Tracking
 - **Logging**: 
-  - Iteration number
-  - Wall-clock time
-  - Memory usage (optional)
+  - Iteration number, wall-clock time
+  - Memory usage (if `track_memory=True`)
+  - Training loss (if available from implicit library)
 - **Checkpointing**: 
-  - Save intermediate U, V mỗi 5 iterations (optional)
+  - Save intermediate U, V mỗi `checkpoint_interval` iterations
+  - Location: `checkpoint_dir/checkpoint_iter_{N}.npz`
   - Cho early stopping nếu validation loss tăng
+- **Validation Monitoring** (Optional):
+  ```python
+  def compute_val_metrics(model, iteration):
+      # Custom validation logic
+      return {'val_loss': 0.123, 'val_recall@10': 0.234}
+  
+  trainer.set_validation_data(X_val, compute_val_metrics)
+  results = trainer.fit(X_train)
+  ```
 
 ### Step 4: Extract Embeddings
 
-#### 4.1 User Embeddings
-- **Matrix U**: Shape (num_users, factors)
-- **Access**: `model.user_factors` (NumPy array)
-- **Normalization**: Optional L2 normalize rows cho cosine similarity
+#### 4.1 Extract Embeddings
+- **Module**: `recsys/cf/model/als/embeddings.py`
+- **Class**: `EmbeddingExtractor`
+- **Methods**:
+  - `get_embeddings()`: Extract U and V matrices
+  - `normalize_embeddings()`: Optional L2 normalization
+  - `compute_embedding_quality_score()`: Quality metrics
 
-#### 4.2 Item Embeddings
+**Usage**:
+```python
+from recsys.cf.model.als import EmbeddingExtractor, extract_embeddings
+
+# Method 1: Using class
+extractor = EmbeddingExtractor(model, normalize=True)
+U, V = extractor.get_embeddings()
+print(f"U shape: {U.shape}, V shape: {V.shape}")
+print(f"Normalized: {extractor.is_normalized}")
+
+# Method 2: Quick function
+U, V = extract_embeddings(model, normalize=True)
+```
+
+#### 4.2 User Embeddings
+- **Matrix U**: Shape (num_users, factors)
+- **Access**: `model.user_factors` (NumPy array) or `extractor.get_user_embeddings()`
+- **Normalization**: Optional L2 normalize rows cho cosine similarity
+- **Type**: `np.float32` for memory efficiency
+
+#### 4.3 Item Embeddings
 - **Matrix V**: Shape (num_items, factors)
-- **Access**: `model.item_factors`
+- **Access**: `model.item_factors` or `extractor.get_item_embeddings()`
 - **Normalization**: Match với U nếu normalized
+- **Type**: `np.float32` for memory efficiency
 
 ### Step 5: Recommendation Generation (For Evaluation)
 
-#### 5.1 Batch Scoring
+#### 5.1 Recommendation Module
+- **Module**: `recsys/cf/model/als/recommender.py`
+- **Class**: `ALSRecommender`
+- **Features**:
+  - Single user recommendations
+  - Batch recommendations for multiple users
+  - Automatic seen item filtering
+  - ID mapping (u_idx ↔ user_id, i_idx ↔ product_id)
+
+**Usage**:
+```python
+from recsys.cf.model.als import ALSRecommender, quick_recommend
+
+# Method 1: Using class
+recommender = ALSRecommender(
+    user_factors=U,
+    item_factors=V,
+    user_to_idx=mappings['user_to_idx'],
+    idx_to_user=mappings['idx_to_user'],
+    item_to_idx=mappings['item_to_idx'],
+    idx_to_item=mappings['idx_to_item'],
+    user_pos_train=user_pos_train
+)
+
+# Single user
+result = recommender.recommend(user_id='12345', k=10, filter_seen=True)
+print(f"Top items: {result.item_ids[:5]}")
+print(f"Scores: {result.scores[:5]}")
+
+# Batch recommendations
+results = recommender.recommend_batch(user_ids=test_users, k=10)
+
+# Method 2: Quick function
+quick_recs = quick_recommend(
+    U, V, 
+    user_ids=test_users, 
+    k=10, 
+    mappings=mappings,
+    user_pos_train=user_pos_train
+)
+```
+
+#### 5.2 Batch Scoring
 - **Method**: `U @ V.T` → (num_users, num_items) score matrix
 - **Optimization**: 
   - Compute chỉ cho test users (subset U)
   - Sử dụng sparse operations nếu possible
+  - Batch processing for memory efficiency
 
-#### 5.2 Filtering Seen Items
+#### 5.3 Filtering Seen Items
 - **Logic**: Cho mỗi user u, mask scores tại indices trong `user_pos_train[u]`
 - **Implementation**: Set scores = -inf hoặc remove từ candidates
+- **Automatic**: Handled by `ALSRecommender` if `filter_seen=True`
 
-#### 5.3 Top-K Selection
+#### 5.4 Top-K Selection
 - **Method**: `np.argsort` hoặc `np.argpartition` (faster cho large K)
-- **Output**: Array (num_users, K) với item indices
-- **Map back**: i_idx → product_id sử dụng `idx_to_item` mapping
+- **Output**: `RecommendationResult` object với:
+  - `item_ids`: List of product IDs (mapped from i_idx)
+  - `scores`: List of recommendation scores
+  - `item_indices`: Original i_idx values
+- **Map back**: Automatic via `idx_to_item` mapping
 
 ### Step 6: Evaluation
 
-#### 6.1 Metrics Computation
+#### 6.1 Evaluation Module
+- **Module**: `recsys/cf/model/als/evaluation.py`
+- **Class**: `ALSEvaluator`
+- **Features**:
+  - Recall@K, NDCG@K computation
+  - Popularity baseline comparison
+  - Batch evaluation for multiple users
+  - Comprehensive metrics summary
+
+**Usage**:
+```python
+from recsys.cf.model.als import ALSEvaluator, quick_evaluate
+
+# Method 1: Using class
+evaluator = ALSEvaluator(
+    user_factors=U,
+    item_factors=V,
+    user_to_idx=mappings['user_to_idx'],
+    idx_to_user=mappings['idx_to_user'],
+    item_to_idx=mappings['item_to_idx'],
+    idx_to_item=mappings['idx_to_item'],
+    user_pos_train=user_pos_train,
+    user_pos_test=user_pos_test
+)
+
+results = evaluator.evaluate(k_values=[10, 20], compare_baseline=True)
+results.print_summary()
+print(f"Recall@10: {results.metrics['recall@10']:.3f}")
+print(f"Improvement: {results.improvement['recall@10']}")
+
+# Method 2: Quick function
+metrics = quick_evaluate(
+    U, V, 
+    user_pos_test, 
+    user_pos_train, 
+    k_values=[10, 20]
+)
+```
+
+#### 6.2 Metrics Computation
 - **Recall@K**: % test items trong top-K recommendations
 - **NDCG@K**: Discounted cumulative gain (xem Task 03)
 - **K values**: [10, 20] (configurable)
+- **Output**: `EvaluationResult` object với:
+  - `metrics`: Dict with recall@k, ndcg@k for each k
+  - `baseline_metrics`: Popularity baseline metrics
+  - `improvement`: Percentage improvement over baseline
 
-#### 6.2 Baseline Comparison
+#### 6.3 Baseline Comparison
 - **Popularity Baseline**: 
   - Rank items theo `item_popularity` từ train data
   - Hoặc `num_sold_time` từ `data_product.csv`
+- **Class**: `PopularityBaseline` in `evaluation.py`
 - **Purpose**: Verify CF beats naive popularity
+- **Automatic**: Computed if `compare_baseline=True`
 
 ### Step 7: Save Artifacts
 
-#### 7.1 Model Files
+#### 7.1 Artifact Saving Module
+- **Module**: `recsys/cf/model/als/artifact_saver.py`
+- **Class**: `ALSArtifacts` (dataclass container)
+- **Main Function**: `save_als_complete()` - One-line orchestrator
+- **Features**:
+  - Save all artifacts (embeddings, params, metrics, metadata)
+  - **Score Range Computation** (Critical for Task 08)
+  - Version tracking and metadata
+  - Comprehensive error handling
+
+**Usage**:
+```python
+from recsys.cf.model.als import save_als_complete, compute_score_range
+
+# Complete save with score range
+artifacts = save_als_complete(
+    user_embeddings=U,
+    item_embeddings=V,
+    params={'factors': 64, 'regularization': 0.01, 'iterations': 15, 'alpha': 10},
+    metrics={'recall@10': 0.234, 'ndcg@10': 0.189, ...},
+    validation_user_indices=[10, 25, 42, ...],  # Critical for score range
+    data_version_hash='abc123def456',
+    output_dir='artifacts/cf/als'
+)
+
+print(artifacts.summary())
+# Score range: [0.012, 1.123] for Task 08 normalization
+```
+
+#### 7.2 Model Files
 - **Location**: `artifacts/cf/als/`
 - **Files**:
-  - `als_U.npy`: User embeddings
-  - `als_V.npy`: Item embeddings
+  - `als_U.npy`: User embeddings (num_users, factors)
+  - `als_V.npy`: Item embeddings (num_items, factors)
   - `als_model.pkl`: Serialized `implicit` model object (optional)
 
-#### 7.2 Configuration
+#### 7.3 Configuration
 - **File**: `als_params.json`
 - **Content**:
   ```json
@@ -266,13 +560,15 @@ model = AlternatingLeastSquares(
     "factors": 64,
     "regularization": 0.01,
     "iterations": 15,
-    "alpha": 40,
+    "alpha": 10,
     "random_seed": 42,
-    "training_time_seconds": 45.2
+    "training_time_seconds": 45.2,
+    "use_gpu": false,
+    "dtype": "float32"
   }
   ```
 
-#### 7.3 Metrics
+#### 7.4 Metrics
 - **File**: `als_metrics.json`
 - **Content**:
   ```json
@@ -287,13 +583,13 @@ model = AlternatingLeastSquares(
   }
   ```
 
-#### 7.4 Metadata (UPDATED - Add Score Range for Global Normalization)
+#### 7.5 Metadata (UPDATED - Add Score Range for Global Normalization)
 - **File**: `als_metadata.json`
 - **Content**:
   - Timestamp huấn luyện
   - Data version hash (từ Task 01)
   - Git commit hash (code version)
-  - System info (CPU/GPU, memory)
+  - System info (CPU/GPU, memory, platform)
   - **NEW - CF Score Range** (Critical for Task 08 normalization):
     ```json
     {
@@ -304,49 +600,128 @@ model = AlternatingLeastSquares(
         "mean": 0.32,
         "std": 0.21,
         "p01": 0.01,
-        "p99": 1.12
+        "p99": 1.12,
+        "num_samples": 50000
       }
     }
     ```
-  - **Computation**: Run U @ V.T on validation set, compute percentiles
+  - **Computation**: 
+    - Function: `compute_score_range(U, V, validation_user_indices, user_pos_train)`
+    - Runs `U @ V.T` on validation users, computes percentiles
+    - Excludes seen items from score distribution
   - **Purpose**: Enable global normalization in hybrid reranking (Task 08)
+  - **Usage**: Prevents score range mismatch between CF and content-based models
 
 ## BPR Pipeline
 
 ### Step 1: Data Preparation
 
-#### 1.1 Load Positive Sets
-- **Method**: `DataProcessor.build_bpr_positive_sets`
-- **Input**: DataFrame with `is_positive=1` (Rating ≥ 4.0)
-- **Output**: `Dict[u_idx, Set[i_idx]]`
+#### 1.1 Load BPR Data
+- **Module**: `recsys/cf/model/bpr/pre_data.py`
+- **Class**: `BPRDataPreparer` / `BPRDataLoader`
+- **Method**: `load_bpr_data()` or `prepare_bpr_data()`
+- **Input**: Processed data from Task 01
+- **Output**: 
+  - `positive_pairs`: Array of (u_idx, i_idx) pairs
+  - `user_pos_sets`: Dict[u_idx, Set[i_idx]]
+  - `hard_neg_sets`: Dict[u_idx, Set[i_idx]] (explicit + implicit)
+  - `num_users`, `num_items`: Dimensions
+
+**Usage**:
+```python
+from recsys.cf.model.bpr import BPRDataLoader, load_bpr_data
+
+# Method 1: Using class
+loader = BPRDataLoader(base_path='data/processed')
+data = loader.load_bpr_data()
+
+# Method 2: Quick function
+data = load_bpr_data(base_path='data/processed')
+```
 
 #### 1.2 Positive Pairs List
-- **Format**: Derived from `user_pos_sets` or DataFrame
-- **Definition**: `(u, i)` where `rating >= 4.0`
+- **Format**: NumPy array of shape (N, 2) with columns [u_idx, i_idx]
+- **Definition**: `(u, i)` where `rating >= 4.0` (positive threshold)
+- **Source**: Derived from `user_pos_sets` or DataFrame
+- **Usage**: Input for triplet sampling in training loop
 
 ### Step 2: Dual Hard Negative Mining Strategy (Implemented)
 
-#### 2.1 Hard Negative Sampling - Explicit + Implicit
-- **Method**: `DataProcessor.prepare_bpr_labels` -> `BPRDataPreparer.mine_hard_negatives`
-- **Output**: `hard_neg_sets` (Dict[u, Set[i]])
-- **Composition**:
-  - **Explicit**: Items with `rating <= 3.0` (User disliked)
-  - **Implicit**: Top-50 popular items user DID NOT interact with
-- **Sampling Logic** (in Training Loop):
-  - `30%` from `hard_neg_sets` (Mixed Explicit/Implicit)
-  - `70%` Uniform Random from unseen items
+#### 2.1 Hard Negative Sampling Module
+- **Module**: `recsys/cf/model/bpr/sampler.py`
+- **Class**: `HardNegativeMixer`
+- **Features**:
+  - Dual-strategy: Explicit (rating ≤3) + Implicit (Top-K popular, not bought)
+  - Mixed sampling: 30% hard negatives + 70% random
+  - Efficient batch sampling
+  - Statistics tracking
 
-#### 2.2 Implicit Negative Generation Details
-- **Source**: `BPRDataPreparer._find_implicit_negatives`
-- **Logic**: `Top-50 Popular - User Interactions`
-- **Why**: "Everyone bought this, but you didn't" = Strong negative signal
+**Usage**:
+```python
+from recsys.cf.model.bpr import HardNegativeMixer, TripletSampler
 
-#### 2.3 Fallback Strategy
+# Initialize mixer
+mixer = HardNegativeMixer(
+    hard_neg_sets=hard_neg_sets,  # From Step 1
+    hard_ratio=0.3,  # 30% hard, 70% random
+    random_seed=42
+)
+
+# Sample negative for a user
+neg_idx = mixer.sample_negative(
+    user_idx=42,
+    positive_set=user_pos_sets[42],
+    num_items=2231
+)
+
+# Batch sampling
+neg_indices = mixer.sample_negatives_batch(
+    user_indices=np.array([10, 20, 30]),
+    user_pos_sets=user_pos_sets,
+    num_items=2231
+)
+```
+
+#### 2.2 Triplet Sampling
+- **Class**: `TripletSampler`
+- **Method**: `sample_triplets()` or `sample_epoch()`
+- **Logic**:
+  - For each positive (u, i_pos), sample negative i_neg
+  - 30% from `hard_neg_sets` (explicit + implicit)
+  - 70% uniformly random from unseen items
+- **Output**: Array of (u, i_pos, i_neg) triplets
+
+**Usage**:
+```python
+from recsys.cf.model.bpr import TripletSampler
+
+sampler = TripletSampler(
+    positive_pairs=data['positive_pairs'],
+    user_pos_sets=data['user_pos_sets'],
+    hard_neg_mixer=mixer,
+    num_items=data['num_items'],
+    samples_per_epoch=5,  # multiplier of num_positives
+    random_seed=42
+)
+
+# Sample triplets for one epoch
+triplets = sampler.sample_epoch()
+# Returns: (N, 3) array with columns [u_idx, i_pos_idx, i_neg_idx]
+```
+
+#### 2.3 Hard Negative Composition
+- **Explicit**: Items with `rating <= 3.0` (User bought but disliked)
+- **Implicit**: Top-50 popular items (by `num_sold_time`) user DID NOT interact with
+- **Logic**: "Hot product but you didn't buy → implicit negative preference"
+- **Source**: Prepared in Task 01 (`BPRDataPreparer.mine_hard_negatives`)
+
+#### 2.4 Fallback Strategy
 - **For users without hard negatives**: 
-  - Fallback to 100% random sampling or popularity-biased sampling
-  - `BPRDataPreparer` handles this by returning empty sets for those users
+  - Fallback to 100% random sampling
+  - `HardNegativeMixer` handles this automatically
+  - Statistics tracked: `stats['fallback_to_random']`
 
-#### 2.4 Samples Per Epoch
+#### 2.5 Samples Per Epoch
 - **Rule**: `samples_per_epoch = num_positives * multiplier`
 - **Default multiplier**: 5 (balance coverage vs speed)
 - **Total samples**: ~1.8M triplets per epoch with multiplier=5
@@ -354,82 +729,158 @@ model = AlternatingLeastSquares(
   - % triplets using explicit hard negatives
   - % triplets using implicit hard negatives
   - % triplets using random negatives
-  - Average hard negative quality score
+  - Available via `mixer.stats` or `sampler.get_sampling_stats()`
 
 ### Step 3: Model Initialization
 
-#### 3.1 Embedding Matrices
-- **U**: Shape (num_users, factors)
-- **V**: Shape (num_items, factors)
-- **Initialization**: 
-  - Gaussian noise: `np.random.randn * 0.01`
-  - Mean=0, std=0.01 (small values prevent exploding gradients)
-- **Random seed**: Fix để reproducible
+#### 3.1 Model Initialization Module
+- **Module**: `recsys/cf/model/bpr/model_init.py`
+- **Class**: `BPRModelInitializer`
+- **Features**:
+  - Random initialization (Gaussian)
+  - Optional BERT initialization for item embeddings
+  - Preset configurations
+  - Reproducible random seed
 
-#### 3.2 Hyperparameters
+**Usage**:
+```python
+from recsys.cf.model.bpr import BPRModelInitializer, initialize_bpr_model
+
+# Method 1: Using class
+initializer = BPRModelInitializer(
+    num_users=26000,
+    num_items=2231,
+    factors=64,
+    random_seed=42
+)
+U, V = initializer.initialize_embeddings()
+
+# Method 2: With BERT initialization
+U, V = initializer.initialize_embeddings(
+    bert_embeddings=bert_embeddings,  # (num_items, 768)
+    item_mapping=item_to_idx
+)
+
+# Method 3: Quick function
+U, V = initialize_bpr_model(
+    num_users=26000,
+    num_items=2231,
+    factors=64,
+    random_seed=42
+)
+```
+
+#### 3.2 Embedding Matrices
+- **U**: Shape (num_users, factors) - User embeddings
+- **V**: Shape (num_items, factors) - Item embeddings
+- **Initialization**: 
+  - **Random**: Gaussian noise `np.random.randn * 0.01` (mean=0, std=0.01)
+  - **BERT**: Optional initialization from PhoBERT embeddings (projected to factors dim)
+  - Small values prevent exploding gradients
+- **Random seed**: Fixed for reproducibility (default: 42)
+
+#### 3.3 Hyperparameters
 - **factors**: 64 (match ALS cho fair comparison)
 - **learning_rate**: 0.05 (tune 0.01-0.1)
 - **regularization**: 0.0001 (L2 penalty, tune 1e-5 to 1e-3)
 - **epochs**: 50 (monitor validation early stopping)
+- **lr_decay**: 0.9 (learning rate decay factor)
+- **lr_decay_every**: 10 (decay every N epochs)
 
 ### Step 4: Training Loop
 
-#### 4.1 Epoch Structure
+#### 4.1 Training Module
+- **Module**: `recsys/cf/model/bpr/trainer.py`
+- **Class**: `BPRTrainer`
+- **Features**:
+  - Mini-batch SGD with BPR loss
+  - Hard negative mining (30% hard + 70% random)
+  - Learning rate decay
+  - Early stopping
+  - Checkpoint saving
+  - Training history tracking
+
+**Usage**:
 ```python
-for epoch in range(epochs):
-    # Shuffle triplets
-    triplets = sample_triplets(user_pos_train, num_samples)
-    
-    for (u, i_pos, i_neg) in triplets:
-        # Compute scores
-        score_pos = U[u] @ V[i_pos]
-        score_neg = U[u] @ V[i_neg]
-        
-        # BPR loss gradient
-        x_uij = score_pos - score_neg
-        sigmoid = 1 / (1 + np.exp(-x_uij))
-        
-        # Update U[u]
-        grad_u = (1 - sigmoid) * (V[i_pos] - V[i_neg]) - reg * U[u]
-        U[u] += lr * grad_u
-        
-        # Update V[i_pos]
-        grad_v_pos = (1 - sigmoid) * U[u] - reg * V[i_pos]
-        V[i_pos] += lr * grad_v_pos
-        
-        # Update V[i_neg]
-        grad_v_neg = -(1 - sigmoid) * U[u] - reg * V[i_neg]
-        V[i_neg] += lr * grad_v_neg
-    
-    # Evaluate on validation (optional)
-    if epoch % 5 == 0:
-        val_metrics = evaluate_model(U, V, val_data, k=10)
-        log_metrics(epoch, val_metrics)
+from recsys.cf.model.bpr import BPRTrainer, train_bpr_model
+
+# Method 1: Using class
+trainer = BPRTrainer(
+    U=U,
+    V=V,
+    learning_rate=0.05,
+    regularization=0.0001,
+    lr_decay=0.9,
+    lr_decay_every=10,
+    checkpoint_dir=Path('artifacts/cf/bpr/checkpoints'),
+    checkpoint_interval=5,
+    random_seed=42
+)
+
+results = trainer.fit(
+    positive_pairs=data['positive_pairs'],
+    user_pos_sets=data['user_pos_sets'],
+    hard_neg_sets=data['hard_neg_sets'],
+    num_items=data['num_items'],
+    epochs=50,
+    samples_per_epoch=5
+)
+
+# Access training history
+history = trainer.history
+print(f"Best epoch: {history.get_best_epoch('recall@10')}")
+
+# Method 2: Quick function
+U, V, history = train_bpr_model(
+    U_init=U,
+    V_init=V,
+    positive_pairs=data['positive_pairs'],
+    user_pos_sets=data['user_pos_sets'],
+    hard_neg_sets=data['hard_neg_sets'],
+    num_items=data['num_items'],
+    epochs=50,
+    learning_rate=0.05,
+    regularization=0.0001
+)
 ```
 
-#### 4.2 Monitoring
-- **Loss proxy**: Average `log(sigmoid(x_uij))` per epoch
-- **Validation metrics**: Recall@10 mỗi 5 epochs
-- **Early stopping**: Nếu validation Recall không cải thiện 3 epochs liên tiếp
+#### 4.2 BPR Loss & Updates
+- **Loss**: `L = -log(sigmoid(x_uij)) + reg * (||U[u]||^2 + ||V[i]||^2 + ||V[j]||^2)`
+- **Where**: `x_uij = U[u] @ V[i] - U[u] @ V[j]` (score difference)
+- **Update Rules** (SGD):
+  - `U[u] += lr * ((1 - sigmoid) * (V[i] - V[j]) - reg * U[u])`
+  - `V[i] += lr * ((1 - sigmoid) * U[u] - reg * V[i])`
+  - `V[j] += lr * (-(1 - sigmoid) * U[u] - reg * V[j])`
 
-#### 4.3 Learning Rate Decay (Optional)
-- **Schedule**: `lr = lr_init * (0.9 ** (epoch // 10))`
+#### 4.3 Monitoring
+- **Loss proxy**: Average `log(sigmoid(x_uij))` per epoch
+- **Training History**: `TrainingHistory` dataclass tracks:
+  - Epochs, losses, validation metrics, learning rates, durations
+- **Validation metrics**: Recall@10 mỗi N epochs (configurable)
+- **Early stopping**: Nếu validation Recall không cải thiện N epochs liên tiếp
+- **Checkpointing**: Save U, V mỗi `checkpoint_interval` epochs
+
+#### 4.4 Learning Rate Decay
+- **Schedule**: `lr = lr_init * (lr_decay ** (epoch // lr_decay_every))`
+- **Default**: `lr_decay=0.9`, `lr_decay_every=10`
 - **Purpose**: Finer updates khi converge
+- **Automatic**: Handled by `BPRTrainer` if configured
 
 ### Step 5: Recommendation Generation
 
-#### 5.1 Scoring
-- **Formula**: `scores[u] = U[u] @ V.T`
-- **Shape**: (num_items,) per user
-
-#### 5.2 Filtering & Ranking
-- Same as ALS: Mask seen items, argsort, top-K
+#### 5.1 Recommendation Module
+- **Note**: BPR recommendation generation similar to ALS
+- **Formula**: `scores[u] = U[u] @ V.T` → (num_items,) per user
+- **Filtering**: Mask seen items, argsort, top-K
+- **Implementation**: Can reuse `ALSRecommender` class or implement similar logic
 
 ### Step 6: Evaluation
 
-#### 6.1 Compute Metrics
-- Same metrics as ALS: Recall@K, NDCG@K
-- Compare với popularity baseline
+#### 6.1 Evaluation Module
+- **Note**: BPR evaluation similar to ALS
+- **Metrics**: Recall@K, NDCG@K
+- **Baseline**: Compare với popularity baseline
+- **Implementation**: Can reuse `ALSEvaluator` class or implement similar logic
 
 #### 6.2 AUC (Optional)
 - **Definition**: Area under ROC curve
@@ -438,18 +889,46 @@ for epoch in range(epochs):
 
 ### Step 7: Save Artifacts
 
-#### 7.1 Files Structure (Mirror ALS)
+#### 7.1 Artifact Saving Module
+- **Module**: `recsys/cf/model/bpr/artifact_saver.py`
+- **Class**: `BPRArtifacts` (dataclass container)
+- **Main Function**: `save_bpr_complete()` - One-line orchestrator
+- **Features**:
+  - Save all artifacts (embeddings, params, metrics, metadata)
+  - **Score Range Computation** (Critical for Task 08)
+  - Training history tracking
+  - Version tracking and metadata
+
+**Usage**:
+```python
+from recsys.cf.model.bpr import save_bpr_complete, compute_bpr_score_range
+
+# Complete save with score range
+artifacts = save_bpr_complete(
+    user_embeddings=trainer.U,
+    item_embeddings=trainer.V,
+    params=trainer.get_params(),
+    metrics={'recall@10': 0.234, 'ndcg@10': 0.189, ...},
+    training_history=trainer.history,
+    validation_user_indices=[10, 25, 42, ...],  # Critical for score range
+    data_version_hash='abc123def456',
+    output_dir='artifacts/cf/bpr'
+)
+```
+
+#### 7.2 Files Structure (Mirror ALS)
 - **Location**: `artifacts/cf/bpr/`
 - **Files**:
-  - `bpr_U.npy`, `bpr_V.npy`
-  - `bpr_params.json`
-  - `bpr_metrics.json`
-  - `bpr_metadata.json` (UPDATED - Add Score Range)
+  - `bpr_U.npy`, `bpr_V.npy`: User and item embeddings
+  - `bpr_params.json`: Training hyperparameters
+  - `bpr_metrics.json`: Evaluation metrics
+  - `bpr_metadata.json`: Comprehensive metadata (UPDATED - Add Score Range)
+  - `bpr_training_history.json`: Training curves (optional)
 
-#### 7.2 Additional BPR-Specific Metadata
-- **Sampling config**: uniform/popularity, samples_per_epoch
+#### 7.3 Additional BPR-Specific Metadata
+- **Sampling config**: hard_ratio, samples_per_epoch, sampling strategy
 - **Convergence**: Epoch tốt nhất (early stopping)
-- **Training curves**: Loss và metrics theo epoch (CSV hoặc JSON)
+- **Training curves**: Loss và metrics theo epoch (stored in `TrainingHistory`)
 - **NEW - CF Score Range** (Critical for Task 08 normalization):
   ```json
   {
@@ -460,11 +939,15 @@ for epoch in range(epochs):
       "mean": 0.48,
       "std": 0.28,
       "p01": -0.12,
-      "p99": 1.38
+      "p99": 1.38,
+      "num_samples": 50000
     }
   }
   ```
-- **Computation**: Run dot(U[user], V[items]) on validation set, compute percentiles
+- **Computation**: 
+  - Function: `compute_bpr_score_range(U, V, validation_user_indices, user_pos_train)`
+  - Runs `U @ V.T` on validation users, computes percentiles
+  - Excludes seen items from score distribution
 - **Purpose**: Enable global normalization in hybrid reranking (Task 08)
 
 ## Hyperparameter Tuning
@@ -525,9 +1008,48 @@ epochs: [30, 50]  # With early stopping
 
 ## Pipeline Orchestration
 
-### Script: `scripts/train_cf.py`
+### Complete Pipeline Scripts
 
-#### CLI Arguments
+#### ALS Complete Pipeline
+- **Module**: `recsys/cf/model/als/run_als_complete.py`
+- **Function**: `run_als_pipeline()`
+- **Features**:
+  - Single function call to run complete pipeline
+  - Automatic data loading from Task 01 outputs
+  - Model initialization, training, evaluation, artifact saving
+  - Score range computation for Task 08
+  - Comprehensive logging
+
+**Usage**:
+```python
+from recsys.cf.model.als.run_als_complete import run_als_pipeline
+
+# Run with default settings
+artifacts = run_als_pipeline()
+
+# Custom configuration
+artifacts = run_als_pipeline(
+    data_dir='data/processed',
+    output_dir='artifacts/cf/als',
+    factors=64,
+    regularization=0.01,
+    iterations=15,
+    alpha=10,
+    use_bert_init=True,
+    bert_embeddings_path='data/processed/content_based_embeddings/product_embeddings.pt'
+)
+```
+
+#### BPR Complete Pipeline
+- **Module**: Similar structure to ALS
+- **Function**: `run_bpr_pipeline()` (if implemented)
+- **Features**: Similar to ALS pipeline
+
+### CLI Scripts (Optional)
+
+#### Script: `scripts/train_cf.py`
+
+**CLI Arguments**:
 ```bash
 python scripts/train_cf.py \
   --model als \                # or bpr
@@ -535,16 +1057,17 @@ python scripts/train_cf.py \
   --data-version latest \      # or specific hash
   --output artifacts/cf/als \
   --gpu                        # optional for ALS
+  --bert-init                  # optional BERT initialization
 ```
 
-#### Workflow
+**Workflow**:
 1. Parse arguments
 2. Load config
 3. Load preprocessed data (Task 01)
-4. Initialize model
+4. Initialize model (with optional BERT init)
 5. Train
 6. Evaluate
-7. Save artifacts
+7. Save artifacts (with score range)
 8. Log results
 
 ### Parallel Training (Optional)
@@ -610,81 +1133,100 @@ Khởi tạo ALS/BPR item embeddings từ BERT embeddings để transfer semanti
 
 **CRITICAL for ≥2 Threshold**: With ~26k trainable users (≥2 interactions) and matrix density ~0.11%, BERT initialization is essential. Higher regularization (λ=0.1) prevents user vectors from drifting too far from semantic space, especially for users with exactly 2 interactions.
 
-#### Implementation: ALS with BERT Init
+#### Implementation: BERT-Enhanced ALS
 
+- **Module**: `recsys/cf/model/bert_enhanced_als.py`
+- **Class**: `BERTEnhancedALS`
+- **Features**:
+  - Loads PhoBERT embeddings from `.pt` file
+  - Projects BERT embeddings (768-dim) to target dimension using SVD/PCA
+  - Aligns embeddings with CSR matrix item ordering
+  - Initializes ALS item factors from projected BERT embeddings
+  - Validates for NaN/Inf values
+  - Comprehensive metadata tracking
+
+**Usage**:
 ```python
-from sklearn.decomposition import TruncatedSVD
+from recsys.cf.model.bert_enhanced_als import BERTEnhancedALS
 
-class BERTEnhancedALS:
-    """
-    ALS với item factors initialized từ BERT embeddings.
-    """
-    
-    def __init__(self, bert_embeddings_path, factors=128, **als_params):
-        self.factors = factors
-        self.als_params = als_params
-        
-        # Load BERT embeddings
-        bert_data = torch.load(bert_embeddings_path)
-        self.bert_embeddings = bert_data['embeddings'].numpy()  # (num_items, 768)
-        self.product_ids = bert_data['product_ids']
-    
-    def project_bert_to_factors(self, target_dim):
-        """
-        Project BERT embeddings (768-dim) xuống target_dim using SVD.
-        """
-        if self.bert_embeddings.shape[1] == target_dim:
-            return self.bert_embeddings
-        
-        svd = TruncatedSVD(n_components=target_dim, random_state=42)
-        projected = svd.fit_transform(self.bert_embeddings)
-        
-        print(f"BERT projection: {self.bert_embeddings.shape[1]} -> {target_dim}")
-        print(f"Explained variance: {svd.explained_variance_ratio_.sum():.3f}")
-        
-        return projected
-    
-    def fit(self, X_train, item_to_idx):
-        """
-        Train ALS với BERT-initialized item factors.
-        """
-        from implicit.als import AlternatingLeastSquares
-        
-        # Initialize ALS model
-        model = AlternatingLeastSquares(
-            factors=self.factors,
-            **self.als_params
-        )
-        
-        # Project BERT embeddings
-        projected_embeddings = self.project_bert_to_factors(self.factors)
-        
-        # Align với item ordering trong CSR matrix
-        aligned_embeddings = np.zeros((X_train.shape[1], self.factors))
-        for i, product_id in enumerate(self.product_ids):
-            if str(product_id) in item_to_idx:
-                idx = item_to_idx[str(product_id)]
-                aligned_embeddings[idx] = projected_embeddings[i]
-        
-        # Initialize item_factors
-        model.item_factors = aligned_embeddings.astype(np.float32)
-        
-        print("Item factors initialized from BERT embeddings")
-        
-        # Fit (ALS will fine-tune from BERT initialization)
-        model.fit(X_train.T)  # Transpose for implicit library
-        
-        return model
+# Initialize BERT-enhanced ALS
+bert_als = BERTEnhancedALS(
+    bert_embeddings_path='data/processed/content_based_embeddings/product_embeddings.pt',
+    factors=64,
+    projection_method='svd',  # or 'pca'
+    regularization=0.1,  # Higher for sparse data
+    iterations=15,
+    alpha=10,
+    random_state=42
+)
+
+# Fit model (automatically initializes item factors from BERT)
+model = bert_als.fit(
+    X_train=X_train_implicit,  # Transposed CSR matrix
+    item_to_idx=mappings['item_to_idx']
+)
+
+# Access embeddings
+U = model.user_factors
+V = model.item_factors
+
+# Get metadata
+metadata = bert_als.get_training_metadata()
+print(f"BERT init used: {metadata['bert_initialization']['enabled']}")
+print(f"Explained variance: {metadata['bert_initialization']['explained_variance']:.3f}")
 ```
+
+**Key Methods**:
+- `project_bert_to_factors(target_dim)`: Projects BERT embeddings using SVD/PCA
+- `align_embeddings_to_matrix(projected_embeddings, item_to_idx, num_items)`: Aligns with matrix ordering
+- `fit(X_train, item_to_idx)`: Trains ALS with BERT initialization
+- `get_training_metadata()`: Returns comprehensive metadata including BERT init info
 
 #### Configuration Extension
 
+**Python Configuration** (matches implementation):
+```python
+# ALS with BERT initialization
+from recsys.cf.model.bert_enhanced_als import BERTEnhancedALS
+
+bert_als = BERTEnhancedALS(
+    bert_embeddings_path="data/processed/content_based_embeddings/product_embeddings.pt",
+    factors=64,
+    projection_method="svd",  # or "pca"
+    regularization=0.1,  # Higher for sparse data
+    iterations=15,
+    alpha=10,
+    random_state=42
+)
+
+# BPR with BERT initialization
+from recsys.cf.model.bpr import BPRModelInitializer
+
+initializer = BPRModelInitializer(
+    num_users=26000,
+    num_items=2231,
+    factors=64
+)
+
+# Load BERT embeddings
+import torch
+bert_data = torch.load('data/processed/content_based_embeddings/product_embeddings.pt')
+bert_embeddings = bert_data['embeddings'].numpy()
+
+# Initialize with BERT
+U, V = initializer.initialize_embeddings(
+    bert_embeddings=bert_embeddings,
+    item_mapping=item_to_idx
+)
+```
+
+**YAML Configuration** (for external config files):
 ```yaml
 als:
-  factors: 128
-  regularization: 0.01
+  factors: 64
+  regularization: 0.1  # Higher for sparse data (≥2 threshold)
   iterations: 15
-  alpha: 40
+  alpha: 10  # Lower for sentiment-enhanced confidence (1-6 range)
   use_gpu: false
   random_seed: 42
   
@@ -692,16 +1234,17 @@ als:
   bert_init:
     enabled: true
     embeddings_path: "data/processed/content_based_embeddings/product_embeddings.pt"
-    projection_method: "svd"  # or "pca", "random"
-    freeze_first_iter: false  # Keep BERT init frozen for first iteration
+    projection_method: "svd"  # or "pca"
+    freeze_first_iter: false  # Not implemented, always fine-tunes
 
 bpr:
-  factors: 128
+  factors: 64
   learning_rate: 0.05
   regularization: 0.0001
   epochs: 50
   samples_per_epoch: 5
-  negative_sampling: "uniform"
+  negative_sampling: "hard_mixed"  # 30% hard + 70% random
+  hard_negative_ratio: 0.3
   random_seed: 42
   
   # BERT initialization

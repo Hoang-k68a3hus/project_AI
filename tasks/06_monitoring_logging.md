@@ -11,6 +11,7 @@ Data Sources
     ↓
 ├─ Training Logs (cf/als.log, cf/bpr.log)
 ├─ Service Logs (service/recommender.log)
+├─ Registry Audit Logs (logs/registry_audit.log)
 ├─ Metrics DB (SQLite/Prometheus)
 └─ Data Quality Checks
     ↓
@@ -18,12 +19,14 @@ Aggregation & Analysis
     ↓
 ├─ Dashboards (Grafana/custom)
 ├─ Alerts (email/Slack)
+├─ Registry Health Monitoring
 └─ Drift Detection
     ↓
 Actions
     ↓
 ├─ Trigger Retrain
 ├─ Rollback Model
+├─ Model Hot Reload
 └─ Notify Team
 ```
 
@@ -86,7 +89,12 @@ CREATE TABLE training_runs (
     git_commit TEXT,
     
     -- Artifacts
-    artifacts_path TEXT
+    artifacts_path TEXT,
+    
+    -- Registry Integration
+    model_id TEXT,  -- Registry model_id
+    registered_at TIMESTAMP,
+    registry_status TEXT  -- 'active', 'archived', 'failed'
 );
 ```
 
@@ -188,11 +196,37 @@ def log_iteration(logger, iteration, loss, time, db_conn, run_id):
 
 ##### Function: `log_training_complete(logger, metrics, artifacts_path, db_conn, run_id)`
 ```python
-def log_training_complete(logger, metrics, artifacts_path, db_conn, run_id):
-    """Log completion và update DB."""
+from recsys.cf.registry import ModelRegistry
+
+def log_training_complete(logger, metrics, artifacts_path, db_conn, run_id, model_type):
+    """Log completion, update DB, và register model."""
     logger.info(f"Training completed | total_time={metrics['training_time']}s")
     logger.info(f"Evaluation | recall@10={metrics['recall@10']:.3f}, ndcg@10={metrics['ndcg@10']:.3f}")
     
+    # Register model in registry
+    registry = ModelRegistry()
+    model_id = registry.register_model(
+        artifacts_path=artifacts_path,
+        model_type=model_type,
+        hyperparameters=metrics.get('hyperparameters', {}),
+        metrics={
+            'recall@10': metrics['recall@10'],
+            'recall@20': metrics.get('recall@20', 0),
+            'ndcg@10': metrics['ndcg@10'],
+            'ndcg@20': metrics.get('ndcg@20', 0),
+            'coverage': metrics.get('coverage', 0)
+        },
+        training_info={
+            'training_time_seconds': metrics['training_time'],
+            'run_id': run_id
+        },
+        data_version=metrics.get('data_version'),
+        baseline_comparison=metrics.get('baseline_comparison')
+    )
+    
+    logger.info(f"Model registered: {model_id}")
+    
+    # Update DB with registry info
     db_conn.execute("""
         UPDATE training_runs
         SET completed_at = ?,
@@ -201,7 +235,10 @@ def log_training_complete(logger, metrics, artifacts_path, db_conn, run_id):
             ndcg_at_10 = ?,
             coverage = ?,
             training_time_seconds = ?,
-            artifacts_path = ?
+            artifacts_path = ?,
+            model_id = ?,
+            registered_at = ?,
+            registry_status = 'active'
         WHERE run_id = ?
     """, (
         datetime.now(),
@@ -210,9 +247,16 @@ def log_training_complete(logger, metrics, artifacts_path, db_conn, run_id):
         metrics['coverage'],
         metrics['training_time'],
         artifacts_path,
+        model_id,
+        datetime.now(),
         run_id
     ))
     db_conn.commit()
+    
+    # Auto-select best model if improved
+    best = registry.select_best_model(metric='ndcg@10')
+    if best and best['model_id'] == model_id:
+        logger.info(f"New best model selected: {model_id} (ndcg@10={best['value']:.4f})")
 ```
 
 ### Training Progress Visualization
@@ -253,7 +297,328 @@ def plot_training_curves(run_id):
     plt.close()
 ```
 
-## Component 2: Service Monitoring
+## Component 2: Registry Monitoring
+
+### Registry Audit Log
+
+#### File: `logs/registry_audit.log`
+```
+2025-01-15 10:32:15 | REGISTER | als_v1_20250115_103000 | ndcg@10=0.189
+2025-01-15 10:32:20 | SELECT_BEST | als_v1_20250115_103000 | ndcg@10=0.189 improvement=+5.2%
+2025-01-15 12:30:10 | REGISTER | bpr_v1_20250115_120000 | ndcg@10=0.192
+2025-01-15 12:30:15 | SELECT_BEST | bpr_v1_20250115_120000 | ndcg@10=0.192 improvement=+1.6%
+2025-01-15 15:00:00 | ARCHIVE | als_v1_20250110_090000 | reason=manual
+2025-01-15 16:00:00 | UPDATE_STATUS | bpr_v1_20250115_120000 | status=failed
+```
+
+### Registry Operations Database
+
+#### Schema: `logs/registry_operations.db` (SQLite)
+
+##### Table: `registry_operations`
+```sql
+CREATE TABLE registry_operations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    timestamp TIMESTAMP,
+    action TEXT,  -- 'REGISTER', 'SELECT_BEST', 'ARCHIVE', 'DELETE', 'UPDATE_STATUS'
+    model_id TEXT,
+    model_type TEXT,
+    details TEXT,  -- JSON with action-specific details
+    
+    -- For SELECT_BEST
+    metric TEXT,
+    metric_value REAL,
+    improvement_pct REAL,
+    previous_best_id TEXT,
+    
+    -- For REGISTER
+    artifacts_path TEXT,
+    data_version TEXT,
+    git_commit TEXT
+);
+```
+
+##### Table: `model_versions`
+```sql
+CREATE TABLE model_versions (
+    model_id TEXT PRIMARY KEY,
+    model_type TEXT,
+    version TEXT,
+    created_at TIMESTAMP,
+    registered_at TIMESTAMP,
+    
+    -- Metrics snapshot
+    recall_at_10 REAL,
+    ndcg_at_10 REAL,
+    coverage REAL,
+    
+    -- Status tracking
+    status TEXT,  -- 'active', 'archived', 'failed'
+    is_current_best BOOLEAN,
+    selected_at TIMESTAMP,
+    
+    -- Lineage
+    data_version TEXT,
+    git_commit TEXT,
+    artifacts_path TEXT
+);
+```
+
+### Registry Monitoring Implementation
+
+#### Module: `recsys/cf/monitoring/registry_monitor.py`
+
+##### Function: `setup_registry_monitoring(registry_path)`
+```python
+from recsys.cf.registry import ModelRegistry
+import sqlite3
+import json
+from datetime import datetime
+
+def setup_registry_monitoring(registry_path='artifacts/cf/registry.json'):
+    """
+    Setup registry monitoring với database tracking.
+    
+    Returns:
+        RegistryMonitor instance
+    """
+    return RegistryMonitor(registry_path)
+
+class RegistryMonitor:
+    """Monitor registry operations và track changes."""
+    
+    def __init__(self, registry_path):
+        self.registry_path = registry_path
+        self.registry = ModelRegistry(registry_path)
+        self.db_path = 'logs/registry_operations.db'
+        self._init_db()
+    
+    def _init_db(self):
+        """Initialize monitoring database."""
+        conn = sqlite3.connect(self.db_path)
+        
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS registry_operations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP,
+                action TEXT,
+                model_id TEXT,
+                model_type TEXT,
+                details TEXT,
+                metric TEXT,
+                metric_value REAL,
+                improvement_pct REAL,
+                previous_best_id TEXT,
+                artifacts_path TEXT,
+                data_version TEXT,
+                git_commit TEXT
+            )
+        """)
+        
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS model_versions (
+                model_id TEXT PRIMARY KEY,
+                model_type TEXT,
+                version TEXT,
+                created_at TIMESTAMP,
+                registered_at TIMESTAMP,
+                recall_at_10 REAL,
+                ndcg_at_10 REAL,
+                coverage REAL,
+                status TEXT,
+                is_current_best BOOLEAN,
+                selected_at TIMESTAMP,
+                data_version TEXT,
+                git_commit TEXT,
+                artifacts_path TEXT
+            )
+        """)
+        
+        conn.commit()
+        conn.close()
+    
+    def log_operation(self, action, model_id, details=None):
+        """Log registry operation to database."""
+        conn = sqlite3.connect(self.db_path)
+        
+        model_info = self.registry.get_model(model_id) if model_id else None
+        
+        conn.execute("""
+            INSERT INTO registry_operations
+            (timestamp, action, model_id, model_type, details, artifacts_path, data_version, git_commit)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            datetime.now(),
+            action,
+            model_id,
+            model_info['model_type'] if model_info else None,
+            json.dumps(details) if details else None,
+            model_info['path'] if model_info else None,
+            model_info.get('data_version') if model_info else None,
+            model_info.get('git_commit') if model_info else None
+        ))
+        
+        conn.commit()
+        conn.close()
+    
+    def sync_model_versions(self):
+        """Sync current registry state to model_versions table."""
+        conn = sqlite3.connect(self.db_path)
+        
+        # Get current best
+        current_best = self.registry.get_current_best()
+        current_best_id = current_best['model_id'] if current_best else None
+        
+        # Sync all models
+        for model_id, model in self.registry._registry['models'].items():
+            is_best = (model_id == current_best_id)
+            
+            conn.execute("""
+                INSERT OR REPLACE INTO model_versions
+                (model_id, model_type, version, created_at, registered_at,
+                 recall_at_10, ndcg_at_10, coverage, status, is_current_best,
+                 selected_at, data_version, git_commit, artifacts_path)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                model_id,
+                model['model_type'],
+                model['version'],
+                model['created_at'],
+                model['created_at'],  # registered_at
+                model['metrics'].get('recall@10'),
+                model['metrics'].get('ndcg@10'),
+                model['metrics'].get('coverage'),
+                model['status'],
+                is_best,
+                current_best['selected_at'] if is_best and current_best else None,
+                model.get('data_version'),
+                model.get('git_commit'),
+                model['path']
+            ))
+        
+        conn.commit()
+        conn.close()
+    
+    def get_registry_health(self):
+        """Get registry health metrics."""
+        stats = self.registry.get_registry_stats()
+        current_best = self.registry.get_current_best()
+        
+        return {
+            'total_models': stats['total_models'],
+            'active_models': stats['active_models'],
+            'archived_models': stats['archived_models'],
+            'current_best': current_best['model_id'] if current_best else None,
+            'current_best_ndcg': (
+                current_best['model_info']['metrics']['ndcg@10']
+                if current_best and current_best.get('model_info') else None
+            ),
+            'by_type': stats['by_type'],
+            'last_updated': stats['last_updated']
+        }
+```
+
+### Model Loader Monitoring
+
+#### Table: `model_loader_stats`
+```sql
+CREATE TABLE model_loader_stats (
+    timestamp TIMESTAMP PRIMARY KEY,
+    model_id TEXT,
+    total_loads INTEGER,
+    cache_hits INTEGER,
+    cache_misses INTEGER,
+    cache_hit_rate REAL,
+    reload_count INTEGER,
+    last_load_time_ms REAL,
+    last_reload_at TIMESTAMP
+);
+```
+
+#### Function: `log_loader_stats(loader)`
+```python
+from recsys.cf.registry import ModelLoader
+
+def log_loader_stats(loader: ModelLoader, db_path='logs/service_metrics.db'):
+    """Log model loader statistics."""
+    import sqlite3
+    
+    stats = loader.get_stats()
+    model_info = loader.get_model_info()
+    
+    conn = sqlite3.connect(db_path)
+    
+    conn.execute("""
+        INSERT INTO model_loader_stats
+        (timestamp, model_id, total_loads, cache_hits, cache_misses,
+         cache_hit_rate, reload_count, last_load_time_ms, last_reload_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        datetime.now(),
+        model_info.get('model_id'),
+        stats['total_loads'],
+        stats['cache_hits'],
+        stats['cache_misses'],
+        stats['cache_hit_rate'],
+        stats['reload_count'],
+        stats['last_load_time_ms'],
+        stats['last_reload_at']
+    ))
+    
+    conn.commit()
+    conn.close()
+```
+
+### Registry Health Checks
+
+#### Function: `check_registry_health()`
+```python
+def check_registry_health(registry_path='artifacts/cf/registry.json'):
+    """
+    Check registry health và alert nếu có vấn đề.
+    
+    Returns:
+        dict: Health status
+    """
+    from recsys.cf.registry import ModelRegistry
+    
+    registry = ModelRegistry(registry_path)
+    health = {
+        'status': 'healthy',
+        'issues': [],
+        'warnings': []
+    }
+    
+    # Check 1: Has current best model
+    current_best = registry.get_current_best()
+    if not current_best:
+        health['status'] = 'unhealthy'
+        health['issues'].append('No current best model selected')
+    
+    # Check 2: Model files exist
+    stats = registry.get_registry_stats()
+    for model_id, model in registry._registry['models'].items():
+        if model['status'] == 'active':
+            import os
+            if not os.path.exists(model['path']):
+                health['status'] = 'unhealthy'
+                health['issues'].append(f"Model {model_id} artifacts missing: {model['path']}")
+    
+    # Check 3: Too many archived models
+    if stats['archived_models'] > 50:
+        health['warnings'].append(f"Too many archived models: {stats['archived_models']}")
+    
+    # Check 4: Registry file corruption
+    try:
+        registry._load_registry()
+    except Exception as e:
+        health['status'] = 'unhealthy'
+        health['issues'].append(f"Registry file corruption: {e}")
+    
+    return health
+```
+
+## Component 3: Service Monitoring
 
 ### Log File Structure
 
@@ -287,7 +652,12 @@ CREATE TABLE requests (
     fallback_method TEXT,
     
     error TEXT,  -- NULL if success
-    model_id TEXT
+    model_id TEXT,
+    
+    -- Registry Integration
+    model_version TEXT,
+    loader_cache_hit BOOLEAN,
+    reload_triggered BOOLEAN
 );
 ```
 
@@ -333,21 +703,31 @@ async def log_requests(request: Request, call_next):
 
 #### Function: `log_request_to_db(body, latency, status)`
 ```python
-def log_request_to_db(body, latency, status):
-    """Log request metrics to SQLite."""
+from recsys.cf.registry import ModelLoader
+
+def log_request_to_db(body, latency, status, loader: ModelLoader = None):
+    """Log request metrics to SQLite với registry info."""
     conn = sqlite3.connect('logs/service_metrics.db')
+    
+    # Get model info from loader
+    model_info = loader.get_model_info() if loader else {}
+    loader_stats = loader.get_stats() if loader else {}
     
     conn.execute("""
         INSERT INTO requests 
-        (timestamp, user_id, topk, exclude_seen, latency_ms, model_id)
-        VALUES (?, ?, ?, ?, ?, ?)
+        (timestamp, user_id, topk, exclude_seen, latency_ms, model_id,
+         model_version, loader_cache_hit, reload_triggered)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         datetime.now(),
         body.get('user_id'),
         body.get('topk', 10),
         body.get('exclude_seen', True),
         latency,
-        recommender.model['model_id']
+        model_info.get('model_id'),
+        model_info.get('version'),
+        loader_stats.get('cache_hit_rate', 0) > 0.5,  # Approximate cache hit
+        False  # reload_triggered - set by reload logic
     ))
     conn.commit()
     conn.close()
@@ -434,7 +814,7 @@ st.metric("Avg Latency", f"{health['avg_latency_ms'].mean():.1f} ms")
 st.metric("Fallback Rate", f"{health['fallback_rate'].mean():.1%}")
 ```
 
-## Component 3: Data Drift Detection
+## Component 4: Data Drift Detection
 
 ### Drift Monitoring
 
@@ -550,7 +930,7 @@ def weekly_drift_check():
 scheduler.start()
 ```
 
-## Component 4: Alerting System
+## Component 5: Alerting System
 
 ### Alert Configuration
 
@@ -584,6 +964,27 @@ alerts:
     window: "weekly"
     severity: "info"
     action: "email"
+  
+  - name: "registry_health"
+    metric: "registry_status"
+    threshold: "unhealthy"
+    window: "5min"
+    severity: "critical"
+    action: "email+slack"
+  
+  - name: "model_reload_failed"
+    metric: "reload_error"
+    threshold: true
+    window: "1min"
+    severity: "warning"
+    action: "email"
+  
+  - name: "no_best_model"
+    metric: "current_best"
+    threshold: null
+    window: "5min"
+    severity: "critical"
+    action: "email+slack"
 
 email:
   smtp_server: "smtp.gmail.com"
@@ -684,7 +1085,7 @@ def check_alert_conditions():
             logger.warning(f"Alert triggered: {alert['name']} | value={value:.3f}, threshold={alert['threshold']}")
 ```
 
-## Component 5: Retrain Trigger
+## Component 6: Retrain Trigger
 
 ### Automatic Retrain Logic
 
@@ -755,7 +1156,7 @@ def check_retrain_trigger():
         logger.info("No retrain needed")
 ```
 
-## Component 6: BERT Embeddings Monitoring
+## Component 7: BERT Embeddings Monitoring
 
 ### Embedding Freshness Tracking
 
@@ -926,13 +1327,91 @@ torch>=1.13.0
 - **Integration & testing**: 1 day
 - **Total**: ~7 days
 
+## Component 8: Registry Integration Summary
+
+### Key Integrations
+
+1. **Training → Registry**: Auto-register models sau training completion
+2. **Registry → Service**: ModelLoader stats tracked trong service metrics
+3. **Registry Health**: Continuous monitoring của registry state
+4. **Model Changes**: Alert khi best model changes hoặc reload fails
+5. **Audit Trail**: All registry operations logged to database
+
+### Registry Monitoring Dashboard
+
+#### Streamlit Dashboard: `service/registry_dashboard.py`
+```python
+import streamlit as st
+import sqlite3
+import pandas as pd
+import plotly.express as px
+from recsys.cf.registry import ModelRegistry
+
+st.title("Model Registry Dashboard")
+
+# Load registry
+registry = ModelRegistry()
+health = check_registry_health()
+
+# Health status
+st.subheader("Registry Health")
+if health['status'] == 'healthy':
+    st.success("✓ Registry is healthy")
+else:
+    st.error(f"✗ Registry issues: {health['issues']}")
+
+# Current best model
+current_best = registry.get_current_best()
+if current_best:
+    st.metric("Current Best Model", current_best['model_id'])
+    st.metric("NDCG@10", f"{current_best['model_info']['metrics']['ndcg@10']:.4f}")
+else:
+    st.warning("No current best model selected")
+
+# Model versions timeline
+conn = sqlite3.connect('logs/registry_operations.db')
+versions = pd.read_sql("""
+    SELECT timestamp, model_id, model_type, metric_value, improvement_pct
+    FROM registry_operations
+    WHERE action = 'SELECT_BEST'
+    ORDER BY timestamp DESC
+    LIMIT 20
+""", conn)
+
+if not versions.empty:
+    fig = px.line(versions, x='timestamp', y='metric_value', 
+                  color='model_type', title='Best Model NDCG@10 Over Time')
+    st.plotly_chart(fig)
+
+# Registry stats
+stats = registry.get_registry_stats()
+col1, col2, col3 = st.columns(3)
+col1.metric("Total Models", stats['total_models'])
+col2.metric("Active Models", stats['active_models'])
+col3.metric("Archived Models", stats['archived_models'])
+
+# Recent operations
+operations = pd.read_sql("""
+    SELECT timestamp, action, model_id, details
+    FROM registry_operations
+    ORDER BY timestamp DESC
+    LIMIT 50
+""", conn)
+st.subheader("Recent Registry Operations")
+st.dataframe(operations)
+```
+
 ## Success Criteria
 
-- [ ] Training runs logged với metrics
-- [ ] Service requests tracked (latency, fallback, rerank)
+- [ ] Training runs logged với metrics và auto-registered
+- [ ] Registry operations tracked trong database
+- [ ] Model loader stats monitored
+- [ ] Registry health checks run continuously
+- [ ] Service requests tracked với model_id và version
 - [ ] Drift detection runs weekly (CF + BERT)
 - [ ] BERT embedding freshness monitored
-- [ ] Alerts sent cho critical issues
-- [ ] Dashboard visualizes metrics
+- [ ] Alerts sent cho critical issues (including registry)
+- [ ] Dashboard visualizes metrics (training + registry + service)
 - [ ] Retrain triggered automatically khi needed
+- [ ] Model hot-reload monitored và logged
 - [ ] Logs retained với rotation policy

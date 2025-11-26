@@ -275,6 +275,28 @@ class StatisticalTester:
         """
         sample = np.asarray(sample)
         n = len(sample)
+        
+        if n == 0:
+            return {
+                'mean': np.nan,
+                'lower': np.nan,
+                'upper': np.nan,
+                'confidence': confidence,
+                'std_err': np.nan,
+                'warning': 'Empty sample'
+            }
+        
+        if n < 2:
+            # Single value - no confidence interval
+            return {
+                'mean': float(sample[0]),
+                'lower': float(sample[0]),
+                'upper': float(sample[0]),
+                'confidence': confidence,
+                'std_err': 0.0,
+                'warning': 'Sample size too small for CI'
+            }
+        
         mean = np.mean(sample)
         std_err = np.std(sample, ddof=1) / np.sqrt(n)
         
@@ -518,6 +540,16 @@ class BootstrapEstimator:
         bootstrap_stats = np.array(bootstrap_stats)
         
         # Percentile method
+        if len(bootstrap_stats) == 0:
+            return {
+                'observed': float(observed),
+                'lower': float(observed),
+                'upper': float(observed),
+                'confidence': confidence,
+                'bootstrap_std': 0.0,
+                'warning': 'No bootstrap samples'
+            }
+        
         alpha = 1 - confidence
         lower = np.percentile(bootstrap_stats, alpha / 2 * 100)
         upper = np.percentile(bootstrap_stats, (1 - alpha / 2) * 100)
