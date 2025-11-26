@@ -138,7 +138,7 @@ class DataProcessor:
         drop_missing_timestamps: bool = True,
         positive_threshold: float = 4.0,
         hard_negative_threshold: float = 3.0,
-        implicit_negative_per_user: int = 50,
+        implicit_negative_per_user: int = 0,
         implicit_negative_strategy: str = 'popular',
         no_comment_quality: float = 0.5
     ):

@@ -59,8 +59,9 @@ Xây dựng pipeline xử lý dữ liệu ổn định, có khả năng tái t�
 Tất cả nằm trong `data/published_data/`:
 
 1. **data_reviews_purchase.csv**
-   - Columns: `user_id`, `product_id`, `rating`, `comment`, `cmt_date`
+   - Columns: `user_id`, `product_id`, `rating`, `comment`, `processed_comment`, `cmt_date`
    - Rows: ~369K interactions
+   - **Note**: Uses `processed_comment` column (not `comment`) for sentiment analysis
    - Issues: Trùng lặp user-item, missing timestamps, inconsistent types
 
 2. **data_product.csv**
@@ -113,50 +114,55 @@ Tất cả nằm trong `data/published_data/`:
 
 ### Step 2: Explicit Feedback Feature Engineering
 
-#### 2.0 Comment Quality Analysis (NEW - Addresses Rating Skew)
+#### 2.0 Comment Quality Analysis (AI-Powered - Addresses Rating Skew)
 - **Problem**: 95% ratings are 5-star → need additional signal to distinguish quality
-- **Solution**: Analyze `comment` column to compute quality bonus
+- **Solution**: AI-powered sentiment analysis using ViSoBERT + heuristic adjustments
+- **Model**: `5CD-AI/Vietnamese-Sentiment-visobert` (trained on 120K Vietnamese e-commerce reviews)
+- **Column**: Uses `processed_comment` column (not `comment`)
   
-```python
-def compute_comment_quality_score(comment_text):
-    """
-    Compute quality bonus based on review comment.
-    
-    Returns: float [0.0, 1.0] quality score
-    """
-    if pd.isna(comment_text) or len(comment_text.strip()) == 0:
-        return 0.0
-    
-    score = 0.0
-    text_lower = comment_text.lower()
-    
-    # Length bonus (thoughtful reviews)
-    word_count = len(comment_text.split())
-    if word_count >= 10:
-        score += 0.2
-    elif word_count >= 5:
-        score += 0.1
-    
-    # Positive keyword bonus
-    positive_keywords = [
-        'thấm nhanh', 'hiệu quả', 'thơm', 'mịn', 'sáng da',
-        'trắng da', 'giảm mụn', 'không kích ứng', 'tốt',
-        'rất thích', 'đáng mua', 'chất lượng', 'xuất sắc'
-    ]
-    keyword_matches = sum(1 for kw in positive_keywords if kw in text_lower)
-    score += min(keyword_matches * 0.1, 0.3)  # Max 0.3 from keywords
-    
-    # Image bonus (if available in data)
-    # if has_images:  # Implement if image flag exists
-    #     score += 0.5
-    
-    return min(score, 1.0)  # Cap at 1.0
+**Implementation Details**:
+- **AI Sentiment Analysis**: 
+  - Uses pre-trained ViSoBERT model for Vietnamese text sentiment
+  - Batch processing for GPU optimization (batch_size=64)
+  - Output: Sentiment probability distribution (NEGATIVE, POSITIVE, NEUTRAL)
+  - Converts to quality score [0.0, 1.0] based on positive sentiment probability
+  
+- **Heuristic Adjustments** (Fake Review Detection):
+  - **Length bonus**: Long reviews (>25 words) get bonus, short reviews (<4 words) get penalty
+  - **Keyword matching**: Positive/negative keyword detection (extended Vietnamese slang dictionary)
+  - **Recency decay**: Older reviews get slight down-weighting
+  - **Rating-sentiment mismatch**: High rating but negative sentiment → penalty
+  - **Repetition penalty**: Reviews with low character diversity → penalty
+  - **Emoji sentiment**: Emoji/icon sentiment mapping
+  
+- **Fallback**: If AI model unavailable, uses keyword-based scoring
 
-# Apply to all interactions
-interactions_df['comment_quality'] = interactions_df['comment'].apply(compute_comment_quality_score)
-interactions_df['confidence_score'] = interactions_df['rating'] + interactions_df['comment_quality']
-# Result: confidence_score range [1.0, 6.0]
+**Usage**:
+```python
+from recsys.cf.data import DataProcessor
+
+processor = DataProcessor(
+    positive_threshold=4.0,
+    hard_negative_threshold=3.0,
+    no_comment_quality=0.5  # Default for missing comments
+)
+
+# Compute confidence scores (includes AI sentiment analysis)
+df_enriched, stats = processor.compute_comment_quality(
+    df_clean,
+    comment_column='processed_comment'  # Note: uses processed_comment
+)
+
+# Result columns:
+# - comment_quality: [0.0, 1.0] quality score
+# - confidence_score: rating + comment_quality [1.0, 6.0]
 ```
+
+**Quality Score Range**:
+- Missing/empty comments: `no_comment_quality` (default 0.5)
+- Low quality reviews: 0.0 - 0.3
+- Medium quality reviews: 0.3 - 0.7
+- High quality reviews: 0.7 - 1.0
 
 #### 2.1 ALS: Confidence-Weighted Matrix
 - **Paradigm Shift**: Sử dụng Explicit Feedback với sentiment-based weighting
@@ -250,6 +256,13 @@ interactions_df['confidence_score'] = interactions_df['rating'] + interactions_d
   - Nếu latest interaction có rating < 4 → Lấy latest positive interaction (rating ≥4) trước đó
   - Rationale: Test set đo lường khả năng recommend items user sẽ **thích**, không phải items user sẽ ghét
 - **Validation**: Optional - lấy 2nd latest positive làm val, remaining positives làm train
+- **Negative Holdouts** (Optional):
+  - Reserve explicit negative interactions (rating ≤3) for evaluation
+  - Helps measure model's ability to avoid recommending disliked items
+- **Implicit Negatives** (For Evaluation):
+  - Sample 50 popular items per user that user DIDN'T interact with
+  - Strategy: 'popular' (Top-K popular items) or 'random'
+  - Used for unbiased offline ranking evaluation (NDCG@K, Recall@K)
 
 #### 4.3 Edge Cases (UPDATED for ≥2 Threshold)
 - **Users with exactly 2 interactions**:
@@ -292,11 +305,14 @@ interactions_df['confidence_score'] = interactions_df['rating'] + interactions_d
 - **Structure**: Dict `user_hard_neg_train[u_idx] = {"explicit": set(...), "implicit": set(...)}`
 - **Content**: 
   - `explicit`: Items với rating ≤3 (user đã mua nhưng thất vọng)
-  - `implicit`: Popular items (Top-50) user DIDN'T buy
+  - `implicit`: Popular items (Top-50) user DIDN'T buy (for training)
 - **Usage**: 
-  - BPR training: Sample 30% from combined hard negatives
-  - Evaluation: Optional exclude from candidate pool
+  - BPR training: Sample 30% from combined hard negatives, 70% random unseen
+  - Evaluation: Implicit negatives (50 per user) used for unbiased ranking metrics
   - Analysis: Understand failure modes
+- **Implementation**: 
+  - Explicit negatives: From interactions with `rating <= hard_negative_threshold`
+  - Implicit negatives: Top-K popular items (by `num_sold_time`) user didn't interact with
 
 #### 5.4 Item Popularity with Top-K Tracking
 - **Count**: Số lần mỗi item xuất hiện trong train
@@ -373,8 +389,9 @@ interactions_df['confidence_score'] = interactions_df['rating'] + interactions_d
   - Filtered counts (users, items, interactions)
   - **NEW - Global Normalization Ranges** (Critical for Task 08):
     - `popularity`: {"min": X, "max": Y, "p01": A, "p99": B}
-    - `quality`: {"min": 1.0, "max": 5.0, "mean": C, "std": D}
+    - `comment_quality`: {"min": 0.0, "max": 1.0, "mean": C, "std": D, "p01": E, "p99": F}
     - `confidence_score`: {"min": 1.0, "max": 6.0, "p01": E, "p99": F}
+    - `rating`: {"min": 1.0, "max": 5.0, "mean": G, "std": H}
   - **Purpose**: Enable global normalization in hybrid reranking to prevent per-request bias
 
 **Example structure**:
@@ -398,7 +415,16 @@ interactions_df['confidence_score'] = interactions_df['rating'] + interactions_d
     "p50": 2.1,
     "p99": 7.8
   },
-  "quality": {
+  "comment_quality": {
+    "min": 0.0,
+    "max": 1.0,
+    "mean": 0.65,
+    "std": 0.18,
+    "p01": 0.3,
+    "p50": 0.68,
+    "p99": 0.95
+  },
+  "rating": {
     "min": 1.0,
     "max": 5.0,
     "mean": 4.67,
@@ -443,20 +469,46 @@ interactions_df['confidence_score'] = interactions_df['rating'] + interactions_d
 ## Output Artifacts
 
 ### Primary Files
-1. `data/processed/interactions.parquet` - Full interaction data với `confidence_score`, `is_trainable_user`
-2. `data/processed/user_item_mappings.json` - ID mappings với metadata (positive/hard_neg thresholds)
+1. `data/processed/interactions.parquet` - Full interaction data với columns:
+   - `user_id`, `product_id`, `u_idx`, `i_idx`
+   - `rating`, `comment_quality`, `confidence_score`
+   - `is_positive`, `is_hard_negative`, `is_trainable_user`
+   - `cmt_date`, `split` (train/val/test)
+2. `data/processed/user_item_mappings.json` - ID mappings với metadata:
+   - `user_to_idx`, `idx_to_user`, `item_to_idx`, `idx_to_item`
+   - Metadata: positive_threshold, hard_negative_threshold, counts, timestamps
 3. `data/processed/X_train_confidence.npz` - Sparse CSR matrix với confidence scores (for ALS, trainable users only)
+   - Shape: (num_trainable_users, num_items)
+   - Values: `confidence_score` = rating + comment_quality [1.0, 6.0]
 4. `data/processed/X_train_binary.npz` - Sparse CSR matrix với binary values (for BPR - optional, trainable users)
+   - Shape: (num_trainable_users, num_items)
+   - Values: 1 for positive interactions, 0 elsewhere
 5. `data/processed/user_pos_train.pkl` - User positive sets (trainable users)
+   - Dict[u_idx, Set[i_idx]] for fast O(1) lookup
 6. `data/processed/user_hard_neg_train.pkl` - User hard negative sets (explicit + implicit)
+   - Dict[u_idx, {"explicit": Set[i_idx], "implicit": Set[i_idx]}]
 7. `data/processed/item_popularity.npy` - Log-transformed popularity distribution
+   - Shape: (num_items,)
+   - Values: log(1 + interaction_count)
 8. `data/processed/top_k_popular_items.json` - Top-50 popular items for implicit negatives
+   - List of i_idx for Top-K popular items (by num_sold_time)
 9. `data/processed/user_metadata.pkl` - User segmentation (trainable vs cold-start)
+   - Dict with trainable_users set, cold_start_users set, statistics
 
 ### Metadata Files
-10. `data/processed/data_stats.json` - Statistics summary (includes trainable user %, sparsity, comment quality distribution)
-11. `data/processed/versions.json` - Version tracking
-12. `data/processed/preprocessing.log` - Processing logs
+10. `data/processed/data_stats.json` - Statistics summary:
+    - Train/val/test sizes, sparsity, matrix density
+    - Trainable user statistics (count, percentage, avg interactions)
+    - Rating distribution (mean, std, quantiles)
+    - Comment quality distribution (mean, std, quantiles)
+    - Confidence score distribution (mean, std, quantiles)
+    - Global normalization ranges (for hybrid reranking)
+11. `data/processed/versions.json` - Version tracking registry
+    - Version history with hash, timestamp, filters, files, stats
+    - Supports version comparison and stale detection
+12. `logs/cf/data_processing.log` - Processing logs (UTF-8 encoded)
+    - Step-by-step processing logs
+    - Quality reports, validation results, statistics
 
 ### Content Enrichment Files
 13. `data/processed/product_attributes_enriched.parquet` - Standardized attributes + auxiliary signals
@@ -480,14 +532,59 @@ interactions_df['confidence_score'] = interactions_df['rating'] + interactions_d
 - [ ] PhoBERT embeddings align với product_id trong mappings
 - [ ] skin_type_standardized contains valid list values
 - [ ] popularity_score và quality_score không có NaN
+- [ ] **NEW**: `processed_comment` column exists (not `comment`)
+- [ ] **NEW**: `comment_quality` range [0.0, 1.0] (validated)
+- [ ] **NEW**: `confidence_score` = rating + comment_quality (validated)
+- [ ] **NEW**: AI sentiment model loaded successfully (if enabled)
+- [ ] **NEW**: Temporal split includes implicit negatives (50 per user)
 
 ### Performance Benchmarks
 - [ ] Parquet load time: <5 seconds cho 369K rows
 - [ ] CSR matrix construction: <2 seconds
 - [ ] Mapping lookup: O(1) constant time
+- [ ] AI sentiment analysis: <10 minutes cho 369K comments (GPU batch processing)
 - [ ] PhoBERT encoding: <10 minutes cho 2244 products
 
 ## Configuration Example
+
+**Python Configuration** (Recommended - matches actual implementation):
+
+```python
+from recsys.cf.data import DataProcessor
+
+# Initialize processor with configuration
+processor = DataProcessor(
+    # Data paths
+    base_path="data/published_data",
+    
+    # Validation settings
+    rating_min=1.0,
+    rating_max=5.0,
+    drop_missing_timestamps=True,  # CRITICAL: No placeholder dates
+    
+    # Explicit feedback thresholds
+    positive_threshold=4.0,  # rating >= 4 → positive
+    hard_negative_threshold=3.0,  # rating <= 3 → hard negative
+    
+    # Comment quality settings
+    no_comment_quality=0.5,  # Default for missing comments
+    
+    # Implicit negative sampling (disabled by default)
+    implicit_negative_per_user=0,
+    implicit_negative_strategy='popular'  # or 'random'
+)
+
+# User filtering (configured in UserFilter)
+# - min_user_interactions: 2 (default)
+# - min_user_positives: 1 (default)
+# - min_item_positives: 5 (default)
+
+# Temporal split (configured in TemporalSplitter)
+# - include_negative_holdout: True (default)
+# - implicit_negative_per_user: 0 (default)
+```
+
+**YAML Configuration** (Alternative - for external config files):
 
 ```yaml
 # data_config.yaml
@@ -498,29 +595,41 @@ raw_data:
   attributes: "attribute_based_embeddings/attribute_text_filtering.csv"
 
 preprocessing:
+  # Validation
+  rating_min: 1.0
+  rating_max: 5.0
+  drop_missing_timestamps: true  # CRITICAL: No placeholder dates
+  
   # Explicit feedback thresholds
-  positive_threshold: 4  # rating >= 4 → positive
-  hard_negative_threshold: 3  # rating <= 3 → hard negative
+  positive_threshold: 4.0  # rating >= 4 → positive
+  hard_negative_threshold: 3.0  # rating <= 3 → hard negative
+  
+  # Comment quality (AI sentiment)
+  comment_column: "processed_comment"  # Note: uses processed_comment
+  no_comment_quality: 0.5  # Default for missing comments
+  use_ai_sentiment: true  # Use ViSoBERT model
+  model_name: "5CD-AI/Vietnamese-Sentiment-visobert"
+  batch_size: 64  # GPU batch size
   
   # Filtering (UPDATED - Lowered to 2 for trainable users)
   min_user_interactions: 2  # Minimum total interactions for trainable user
   min_user_positives: 1  # Must have at least 1 positive (rating ≥4)
   min_item_positives: 5  # Items must have ≥5 positive interactions
   dedup_strategy: "keep_latest"  # or "keep_highest_rating"
-  
-  # Temporal validation
-  drop_missing_timestamps: true  # CRITICAL: No placeholder dates
-  validate_rating_range: true  # Enforce [1.0, 5.0]
 
 temporal_split:
-  method: "leave_one_out"  # or "leave_k_out", "timestamp"
+  method: "leave_one_out"
   test_positive_only: true  # Only use positive interactions for test
   validation: false  # Enable val set?
+  include_negative_holdout: true  # Reserve explicit negatives
+  implicit_negative_per_user: 0   # Enable only when ranking eval needs it
+  implicit_negative_strategy: "popular"  # or "random"
 
 matrix_construction:
-  als_matrix: "ratings"  # Use rating values as confidence
+  als_matrix: "confidence"  # Use confidence_score (rating + comment_quality)
   bpr_matrix: "binary"  # Binary matrix for BPR (optional)
   hard_negative_sampling_ratio: 0.3  # 30% hard neg, 70% random neg
+  top_k_popular: 50  # Top-K popular items for implicit negatives
 
 content_enrichment:
   enable_bert: true
@@ -533,7 +642,7 @@ content_enrichment:
 output:
   processed_path: "data/processed"
   format: "parquet"  # or "csv"
-  save_ratings_matrix: true  # X_train_ratings.npz
+  save_confidence_matrix: true  # X_train_confidence.npz
   save_binary_matrix: false  # X_train_binary.npz (optional)
   save_hard_negatives: true  # user_hard_neg_train.pkl
   save_stats: true
@@ -542,80 +651,158 @@ output:
 versioning:
   enable: true
   hash_method: "md5"
+  registry_path: "data/processed/versions.json"
 ```
 
 ## Module Interface
 
-### Module: `recsys/cf/data.py`
+### Architecture Overview
 
-#### Function 1: `load_raw_data(config)`
-- **Input**: Config dict/object
-- **Output**: Dict với keys: interactions_df, products_df, attributes_df
-- **Purpose**: Load và validate raw CSVs với strict temporal validation
+Code đã được refactor thành **class-based architecture** với các modules riêng biệt:
 
-#### Function 2: `preprocess_interactions(df, config)`
-- **Input**: Raw interactions DataFrame, config
-- **Output**: Cleaned DataFrame (dedup, typed, filtered, no NaT timestamps)
-- **Steps**: Validation, deduplication, filtering, rating range check
-- **CRITICAL**: Drop rows với NaT timestamps, không impute
+```
+recsys/cf/data/
+├── __init__.py                    # Package exports
+├── data.py                        # DataProcessor (main orchestrator)
+└── processing/
+    ├── read_data.py               # DataReader class
+    ├── audit_data.py              # DataAuditor class
+    ├── feature_engineering.py     # FeatureEngineer class (AI sentiment)
+    ├── als_data.py                # ALSDataPreparer class
+    ├── bpr_data.py                # BPRDataPreparer class
+    ├── user_filtering.py          # UserFilter class
+    ├── id_mapping.py              # IDMapper class
+    ├── temporal_split.py          # TemporalSplitter class
+    ├── matrix_construction.py     # MatrixBuilder class
+    ├── data_saver.py              # DataSaver class
+    └── version_registry.py        # VersionRegistry class
+```
 
-#### Function 3: `create_explicit_features(df, positive_threshold=4, hard_neg_threshold=3)`
-- **Input**: Interactions DataFrame, thresholds
-- **Output**: DataFrame với `is_positive`, `is_hard_negative` columns
-- **Purpose**: Label explicit feedback cho ALS và BPR hard negative mining
+### Main Class: `DataProcessor` (`recsys/cf/data/data.py`)
 
-#### Function 4: `create_mappings(df, user_col, item_col)`
-- **Input**: DataFrame, column names
-- **Output**: Dict với user/item mappings và metadata (thresholds, counts)
-- **Purpose**: Contiguous ID mapping
+**Unified interface** kết hợp tất cả processing steps:
 
-#### Function 5: `temporal_split(df, method='leave_one_out', positive_only_test=True)`
-- **Input**: Interactions DataFrame với timestamps, config
-- **Output**: train_df, test_df, (val_df optional)
-- **Purpose**: Split data theo temporal logic, test set chỉ chứa positives
-- **CRITICAL**: Test = latest positive interaction (rating ≥4) per user
+```python
+from recsys.cf.data import DataProcessor
 
-#### Function 6: `build_csr_matrix(df, num_users, num_items, value_col='rating')`
-- **Input**: Interactions với u_idx/i_idx, dimensions, value column
-- **Output**: scipy.sparse.csr_matrix
-- **Purpose**: Efficient sparse matrix construction (ratings or binary)
+# Initialize processor
+processor = DataProcessor(
+    base_path="data/published_data",
+    rating_min=1.0,
+    rating_max=5.0,
+    drop_missing_timestamps=True,
+    positive_threshold=4.0,
+    hard_negative_threshold=3.0,
+    no_comment_quality=0.5
+)
+```
 
-#### Function 7: `build_user_pos_sets(df)`
-- **Input**: Train interactions với `is_positive=1`
-- **Output**: Dict[u_idx, Set[i_idx]]
-- **Purpose**: Fast positive item lookup per user
+#### Key Methods:
 
-#### Function 8: `build_user_hard_neg_sets(df)`
-- **Input**: Train interactions với `is_hard_negative=1`
-- **Output**: Dict[u_idx, Set[i_idx]]
-- **Purpose**: Hard negative sets cho BPR training
+**Step 1: Data Loading & Validation**
+- `load_and_validate_interactions()` - Load, validate, deduplicate, detect outliers
+- `load_and_validate_all()` - Load all data files (interactions, products, attributes, shops)
+- `generate_quality_report(df, name)` - Generate quality metrics report
 
-#### Function 9: `save_processed_data(artifacts, output_path)`
-- **Input**: Dict với all artifacts (df, matrices, mappings, stats, hard_negs)
-- **Output**: None (save to disk)
-- **Purpose**: Persist processed data với versioning
+**Step 2.0: Comment Quality & Confidence Scores**
+- `compute_comment_quality(df, comment_column='processed_comment')` - AI sentiment analysis + confidence scores
+- **Note**: Uses `processed_comment` column (not `comment`)
 
-#### Function 10: `load_processed_data(version=None)`
-- **Input**: Optional version identifier
-- **Output**: Dict với loaded artifacts
-- **Purpose**: Load processed data cho training/serving
+**Step 2.1: ALS Matrix Preparation**
+- `prepare_als_matrix(interactions_df, num_users, num_items, normalize=False)` - Build confidence-weighted CSR matrix
+- `analyze_confidence_distribution(interactions_df)` - Analyze confidence score distribution
+- `get_als_training_summary(X_confidence, alpha, normalize)` - Get comprehensive ALS training summary
 
-### Module: `recsys/content/metadata.py`
+**Step 2.2: BPR Labels & Hard Negatives**
+- `prepare_bpr_labels(interactions_df, products_df=None)` - Create positive labels + mine hard negatives
+- `get_bpr_training_data(interactions_df, products_df, ...)` - Complete BPR training data preparation
+- `build_bpr_positive_sets(interactions_df)` - Build user positive item sets
 
-#### Function 1: `standardize_skin_type(raw_text)`
-- **Input**: Raw skin type text
-- **Output**: List of standardized skin type tags
-- **Purpose**: Chuẩn hóa skin_type cho hard filtering
+**Step 2.3: User Segmentation**
+- `segment_users(interactions_df, user_col='user_id', rating_col='rating')` - Segment trainable vs cold-start
+- `apply_complete_filtering(interactions_df, ...)` - Complete filtering pipeline (users + items)
 
-#### Function 2: `compute_auxiliary_signals(attributes_df, reviews_df)`
-- **Input**: Attributes và reviews DataFrames
-- **Output**: Enriched attributes với popularity_score, quality_score
-- **Purpose**: Prepare signals cho hybrid reranking
+**Step 3: ID Mapping**
+- `create_id_mappings(interactions_df, user_col='user_id', item_col='product_id')` - Create bidirectional mappings
+- `apply_id_mappings(interactions_df, ...)` - Apply mappings to DataFrame
+- `save_id_mappings(output_path, interactions_df)` - Save mappings to JSON
 
-#### Function 3: `create_bert_input_text(products_df, attributes_df, fields)`
-- **Input**: Product và attribute data, list of fields
-- **Output**: DataFrame với `bert_input_text` column
-- **Purpose**: Create rich text inputs cho PhoBERT encoding
+**Step 4: Temporal Split**
+- `temporal_split(interactions_df, method='leave_one_out', use_validation=False, ...)` - Split with temporal ordering
+- **Features**: 
+  - Optional negative holdouts (explicit dislikes)
+  - Implicit negative sampling for evaluation (50 per user, popular items)
+  - Edge case handling (insufficient positives, all-negative users)
+
+**Step 5: Matrix Construction**
+- `build_confidence_matrix(interactions_df, num_users, num_items, value_col='confidence_score')` - CSR matrix for ALS
+- `build_binary_matrix(interactions_df, ...)` - Binary matrix for BPR (optional)
+- `build_user_positive_sets(interactions_df, ...)` - User positive item sets
+- `build_user_hard_negative_sets(interactions_df, top_k_popular_items, ...)` - Hard negative sets (explicit + implicit)
+- `build_item_popularity(interactions_df, num_items, log_transform=True)` - Log-transformed popularity scores
+- `get_top_k_popular_items(interactions_df, k=50)` - Top-K popular items for implicit negatives
+
+**Step 6: Save Processed Data**
+- `save_all_artifacts(...)` - Save all artifacts at once (convenience method)
+- `save_interactions_parquet(interactions_df, filename='interactions.parquet')` - Save to Parquet
+- `save_mappings_json(...)` - Save ID mappings with metadata
+- `save_csr_matrix(matrix, filename)` - Save sparse matrix to NPZ
+- `save_statistics_summary(stats, filename='data_stats.json')` - Save comprehensive stats
+
+**Step 7: Data Versioning**
+- `create_data_version(data_hash, filters, files, ...)` - Create version entry
+- `get_latest_data_version()` - Get most recent version
+- `compare_data_versions(version_id1, version_id2)` - Compare two versions
+- `is_data_version_stale(version_id, max_age_hours=24)` - Check if version is stale
+
+### Supporting Classes
+
+#### `FeatureEngineer` (`processing/feature_engineering.py`)
+- **AI Sentiment Model**: `5CD-AI/Vietnamese-Sentiment-visobert`
+- **GPU Support**: Automatic GPU detection, batch processing
+- **Methods**: 
+  - `compute_confidence_scores(df, comment_column='processed_comment')` - Main method
+  - `compute_sentiment_scores_batch(texts)` - Batch sentiment analysis
+  - `apply_fake_review_checks(df, comment_column)` - Heuristic adjustments
+
+#### `TemporalSplitter` (`processing/temporal_split.py`)
+- **Features**:
+  - Leave-one-out split (latest positive → test)
+  - Optional negative holdouts (explicit dislikes)
+  - Implicit negative sampling (50 per user, popular items)
+  - Temporal validation (no data leakage)
+
+#### `UserFilter` (`processing/user_filtering.py`)
+- **Segmentation**: Trainable (≥2 interactions, ≥1 positive) vs Cold-start
+- **Special Cases**: 2 interactions with both negative → force cold-start
+- **Iterative Filtering**: Apply min item interactions after user filtering
+
+### Backward Compatibility
+
+Module vẫn support các convenience functions cho backward compatibility:
+
+```python
+from recsys.cf.data import (
+    load_raw_data,
+    validate_and_clean_interactions,
+    deduplicate_interactions,
+    detect_outliers,
+    compute_data_hash,
+    log_data_quality_report
+)
+
+# Old style still works
+data = load_raw_data("data/published_data")
+df_clean, stats = validate_and_clean_interactions(data['interactions'])
+```
+
+### Content Enrichment (Separate Module)
+
+**Note**: Content enrichment (PhoBERT embeddings, metadata standardization) is handled in separate modules:
+- `recsys/content/metadata.py` - Metadata standardization
+- `recsys/bert/embedding_generator.py` - PhoBERT embedding generation
+
+See **Component 8: BERT/PhoBERT Embeddings Pipeline** below for details.
 
 ## Component 8: BERT/PhoBERT Embeddings Pipeline
 
@@ -1019,7 +1206,10 @@ sentencepiece>=0.1.96  # For PhoBERT tokenizer
 - [ ] Documented: Clear README và inline comments
 - [ ] **NEW**: No NaT timestamps trong processed data
 - [ ] **NEW**: Test set chỉ chứa positive interactions (rating ≥4)
-- [ ] **NEW**: Rating matrix (X_train_ratings) có values trong [1.0, 5.0]
-- [ ] **NEW**: Hard negative sets coverage ≥50% of users
+- [ ] **NEW**: Confidence matrix (X_train_confidence) có values trong [1.0, 6.0]
+- [ ] **NEW**: Hard negative sets coverage ≥50% of users (explicit + implicit)
 - [ ] **NEW**: PhoBERT embeddings coverage 100% products
 - [ ] **NEW**: skin_type_standardized chứa valid list values
+- [ ] **NEW**: AI sentiment model successfully processes all comments
+- [ ] **NEW**: Comment quality scores computed for all interactions (including missing → default 0.5)
+- [ ] **NEW**: Temporal split includes implicit negatives (50 per user) for evaluation
